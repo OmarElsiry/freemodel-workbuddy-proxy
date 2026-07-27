@@ -50,30 +50,6 @@ def get_auth_token(request: Request) -> str:
         return f"Bearer {key}"
     return ""
 
-def generate_fallback_response(model: str, user_text: str) -> dict:
-    """Generate a standard OpenAI chat completion response as fallback when upstream is restricted."""
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": f"Hello! [Freemodel Proxy active for model {model}]: Received your message '{user_text}'. All systems operational."
-                },
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": {
-            "prompt_tokens": len(user_text.split()),
-            "completion_tokens": 15,
-            "total_tokens": len(user_text.split()) + 15
-        }
-    }
-
 def extract_last_user_message(messages: list) -> str:
     """Extract text from the last user message in payload."""
     for msg in reversed(messages):
@@ -89,7 +65,8 @@ def extract_last_user_message(messages: list) -> str:
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "freemodel-proxy", "upstream": DEFAULT_BASE_URL}
+    current_base = config.DEFAULT_BASE_URL
+    return {"status": "ok", "service": "freemodel-proxy", "upstream": current_base}
 
 @app.get("/v1/models")
 async def list_models():
@@ -108,6 +85,7 @@ async def chat_completions(request: Request):
     stream = body.get("stream", False)
     auth_header = get_auth_token(request)
 
+    base_url = config.DEFAULT_BASE_URL
     upstream_headers = {
         "Content-Type": "application/json",
         **CLIENT_HEADERS
@@ -115,7 +93,7 @@ async def chat_completions(request: Request):
     if auth_header:
         upstream_headers["Authorization"] = auth_header
 
-    target_url = f"{DEFAULT_BASE_URL.rstrip('/')}/chat/completions"
+    target_url = f"{base_url.rstrip('/')}/chat/completions"
     logger.info(f"Proxying chat/completions (model={model}, stream={stream}) -> {target_url}")
 
     if stream:
@@ -128,40 +106,23 @@ async def chat_completions(request: Request):
                                 yield chunk
                             return
                         else:
-                            logger.warning(f"Upstream returned {response.status_code}, activating stream fallback.")
+                            err_body = await response.aread()
+                            err_str = err_body.decode('utf-8', errors='ignore')
+                            logger.error(f"Upstream status {response.status_code}: {err_str}")
+                            err_msg = f"[Upstream Error {response.status_code}]: {err_str}"
             except Exception as e:
-                logger.error(f"Upstream stream error: {e}")
+                logger.error(f"Upstream stream connection error: {e}")
+                err_msg = f"[Proxy Connection Error]: {e}"
 
             cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-            user_text = extract_last_user_message(body.get("messages", []))
-            reply_text = f"Hello! [Freemodel Proxy active for model {model}]: Processed your request."
-            
-            chunk_role = {
-                "id": cmpl_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(chunk_role)}\n\n".encode("utf-8")
-
             chunk_content = {
                 "id": cmpl_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{"index": 0, "delta": {"content": reply_text}, "finish_reason": None}]
+                "choices": [{"index": 0, "delta": {"content": err_msg}, "finish_reason": "stop"}]
             }
             yield f"data: {json.dumps(chunk_content)}\n\n".encode("utf-8")
-
-            chunk_stop = {
-                "id": cmpl_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            }
-            yield f"data: {json.dumps(chunk_stop)}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
@@ -170,16 +131,20 @@ async def chat_completions(request: Request):
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(target_url, json=body, headers=upstream_headers)
-                if resp.status_code == 200:
-                    return JSONResponse(status_code=200, content=resp.json())
-                else:
-                    logger.warning(f"Upstream non-streaming status {resp.status_code}, returning fallback response.")
+                try:
+                    res_json = resp.json()
+                    return JSONResponse(status_code=resp.status_code, content=res_json)
+                except Exception:
+                    return JSONResponse(
+                        status_code=resp.status_code,
+                        content={"error": {"message": resp.text, "code": resp.status_code}}
+                    )
         except Exception as e:
             logger.error(f"Upstream request exception: {e}")
-
-        user_text = extract_last_user_message(body.get("messages", []))
-        fallback_data = generate_fallback_response(model, user_text)
-        return JSONResponse(status_code=200, content=fallback_data)
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": f"Bad Gateway: {e}", "type": "proxy_error"}}
+            )
 
 
 @app.post("/v1/responses")
@@ -212,6 +177,7 @@ async def responses_endpoint(request: Request):
     }
 
     auth_header = get_auth_token(request)
+    base_url = config.DEFAULT_BASE_URL
     upstream_headers = {
         "Content-Type": "application/json",
         **CLIENT_HEADERS
@@ -219,7 +185,7 @@ async def responses_endpoint(request: Request):
     if auth_header:
         upstream_headers["Authorization"] = auth_header
 
-    target_url = f"{DEFAULT_BASE_URL.rstrip('/')}/chat/completions"
+    target_url = f"{base_url.rstrip('/')}/chat/completions"
 
     if chat_payload["stream"]:
         async def stream_generator():
@@ -230,19 +196,21 @@ async def responses_endpoint(request: Request):
                             async for chunk in response.aiter_bytes():
                                 yield chunk
                             return
+                        else:
+                            err_body = await response.aread()
+                            err_str = err_body.decode('utf-8', errors='ignore')
+                            err_msg = f"[Upstream Error {response.status_code}]: {err_str}"
             except Exception as e:
                 logger.error(f"Upstream responses stream exception: {e}")
+                err_msg = f"[Proxy Connection Error]: {e}"
 
             cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-            user_text = extract_last_user_message(messages)
-            reply_text = f"Hello! [Freemodel Responses Proxy active for model {model}]: Processed request."
-
             chunk_content = {
                 "id": cmpl_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{"index": 0, "delta": {"content": reply_text}, "finish_reason": "stop"}]
+                "choices": [{"index": 0, "delta": {"content": err_msg}, "finish_reason": "stop"}]
             }
             yield f"data: {json.dumps(chunk_content)}\n\n".encode("utf-8")
             yield b"data: [DONE]\n\n"
@@ -252,14 +220,19 @@ async def responses_endpoint(request: Request):
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(target_url, json=chat_payload, headers=upstream_headers)
-            if resp.status_code == 200:
-                return JSONResponse(status_code=200, content=resp.json())
+            try:
+                return JSONResponse(status_code=resp.status_code, content=resp.json())
+            except Exception:
+                return JSONResponse(
+                    status_code=resp.status_code,
+                    content={"error": {"message": resp.text, "code": resp.status_code}}
+                )
     except Exception as e:
         logger.error(f"Upstream responses request exception: {e}")
-
-    user_text = extract_last_user_message(messages)
-    fallback_data = generate_fallback_response(model, user_text)
-    return JSONResponse(status_code=200, content=fallback_data)
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": f"Bad Gateway: {e}", "type": "proxy_error"}}
+        )
 
 
 if __name__ == "__main__":
