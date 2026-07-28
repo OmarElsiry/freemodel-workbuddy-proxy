@@ -93,8 +93,12 @@ def run_tests():
             r = client.post(f"{BASE_URL}/v1/responses", json=payload, headers=headers)
             assert r.status_code == 200, f"Status {r.status_code}: {r.text}"
             res_data = r.json()
-            assert "choices" in res_data
-            print(f"[PASS] POST /v1/responses: {res_data['choices'][0]['message']['content']}")
+            assert res_data["object"] == "response"
+            assert res_data["status"] == "completed"
+            assert res_data["output"][0]["type"] == "message"
+            content = res_data["output"][0]["content"][0]["text"]
+            assert content
+            print(f"[PASS] POST /v1/responses: {content}")
             passed += 1
         except Exception as e:
             print("[FAIL] POST /v1/responses:", e)

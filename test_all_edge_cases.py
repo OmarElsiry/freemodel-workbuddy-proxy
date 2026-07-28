@@ -165,7 +165,11 @@ def run_exhaustive_tests():
             }
             r = client.post(f"{BASE_URL}/v1/responses", json=p, headers=headers)
             assert r.status_code == 200
-            print("[PASS 11/15] POST /v1/responses (OpenCode non-streaming format)")
+            result = r.json()
+            assert result["object"] == "response"
+            assert result["status"] == "completed"
+            assert result["output"][0]["type"] in ["message", "function_call"]
+            print("[PASS 11/15] POST /v1/responses (native non-streaming format)")
             passed += 1
         except Exception as e:
             print("[FAIL 11/15] POST /v1/responses (non-streaming):", e)
@@ -186,9 +190,20 @@ def run_exhaustive_tests():
             }
             with client.stream("POST", f"{BASE_URL}/v1/responses", json=p, headers=headers) as resp:
                 assert resp.status_code == 200
-                lines = [l for l in resp.iter_lines() if l]
-                assert len(lines) > 0
-                print(f"[PASS 12/15] POST /v1/responses (OpenCode SSE streaming, {len(lines)} lines)")
+                event_names = []
+                event_payloads = []
+                for line in resp.iter_lines():
+                    if line.startswith("event:"):
+                        event_names.append(line.removeprefix("event:").strip())
+                    elif line.startswith("data:"):
+                        event_payloads.append(json.loads(line.removeprefix("data:").strip()))
+                assert event_names
+                assert event_names[-1] == "response.completed"
+                assert event_names.count("response.completed") == 1
+                assert "response.output_item.done" in event_names
+                assert event_payloads[-1]["type"] == "response.completed"
+                assert event_payloads[-1]["response"]["id"].startswith("resp_")
+                print(f"[PASS 12/15] POST /v1/responses (native SSE, {len(event_names)} events)")
                 passed += 1
         except Exception as e:
             print("[FAIL 12/15] POST /v1/responses (streaming):", e)

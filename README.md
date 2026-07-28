@@ -9,7 +9,9 @@ A high-performance, OpenAI-compatible proxy server and Terminal User Interface (
 - ⚡ **OpenAI Compatibility**: Emulates `/v1/chat/completions`, `/v1/models`, and `/v1/responses`.
 - 💬 **Interactive TUI**: Included terminal chat client (`tui.py`) with rich UI, live response streaming, and interactive key setup.
 - 🔑 **Automatic Key Resolution**: Auto-detects and persists API keys locally in `config.json` or reads existing keys from `~/.codex/auth.json`.
-- 🔄 **Auto-Fallback & Stream Handling**: Handles non-streaming and Server-Sent Events (SSE) streaming seamlessly.
+- 🔄 **Native Responses Streaming**: Translates Chat Completions SSE into Responses API events, including the terminal `response.completed` event required by Codex.
+- 🧰 **Function Tool Translation**: Converts Responses function definitions, calls, and outputs to and from Chat Completions tool-call format.
+- 🛡️ **Explicit Stream Failures**: Reports truncated upstream streams as `response.failed` instead of silently closing before completion.
 
 ---
 
@@ -37,7 +39,7 @@ python3 proxy_server.py
 
 ## 🔌 Connecting Your Apps (Cursor, Codex, Continue, OpenCode)
 
-- **Base URL**: `http://localhost:40589/v1`
+- **Base URL**: `http://localhost:40589/v1` (use `/v1`, not `/v1/chat/completions`)
 - **API Key**: `fe_oa_...` (or any dummy key `sk-dummy` if configured in `config.json`)
 - **Supported Models**: `gpt-5.6-sol`, `gpt-4o`, `opencode-default`
 
