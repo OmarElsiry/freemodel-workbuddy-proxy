@@ -180,6 +180,41 @@ class ResponsesProtocolTests(unittest.IsolatedAsyncioTestCase):
             "upstream_stream_incomplete",
         )
 
+    async def test_malformed_stream_fails_once(self):
+        async def handler(request):
+            return httpx.Response(
+                200,
+                content=b"data: not-json\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+
+        response = await self.call_app(
+            {"model": "gpt-5.6-sol", "input": "Hello", "stream": True},
+            handler,
+        )
+        events = self.parse_sse(response)
+        names = [name for name, _ in events]
+        self.assertEqual(names.count("response.failed"), 1)
+        self.assertEqual(names[-1], "response.failed")
+        self.assertNotIn("response.completed", names)
+        self.assertEqual(events[-1][1]["response"]["error"]["code"], "malformed_upstream_sse")
+
+    async def test_done_without_finish_reason_is_not_completion(self):
+        async def handler(request):
+            return httpx.Response(
+                200,
+                content=b'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\ndata: [DONE]\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+
+        response = await self.call_app(
+            {"model": "gpt-5.6-sol", "input": "Hello", "stream": True},
+            handler,
+        )
+        events = self.parse_sse(response)
+        self.assertEqual(events[-1][0], "response.failed")
+        self.assertNotIn("response.completed", [name for name, _ in events])
+
     async def test_messages_fallback_keeps_instructions(self):
         async def handler(request):
             self.captured_requests.append(json.loads(request.content))

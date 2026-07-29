@@ -13,7 +13,8 @@ A high-performance, OpenAI-compatible proxy server and Terminal User Interface (
 - 🧰 **Function Tool Translation**: Converts Responses function definitions, calls, and outputs to and from Chat Completions tool-call format.
 - 🛡️ **Explicit Stream Failures**: Reports truncated upstream streams as `response.failed` instead of silently closing before completion.
 - 🔐 **Official WorkBuddy ACP Transport**: Routes the protected `work.freemodel.dev` endpoint through an active official WorkBuddy gateway instead of imitating private client authentication.
-- 🧭 **Dynamic Gateway Discovery**: Finds a live gateway from `~/.workbuddy-ai/sessions` and skips stale session registrations.
+- 🧭 **Dynamic Gateway Discovery**: Finds live gateways from `~/.workbuddy-ai/sessions`, skips stale registrations, and rotates retryable failures across candidates.
+- 🔒 **Concurrent Request Isolation**: Serializes ACP sessions per gateway to prevent prompt/response crossover while allowing separate gateways to operate concurrently.
 
 ---
 
@@ -41,6 +42,16 @@ python3 proxy_server.py
 ```
 
 Optional settings are `WORKBUDDY_ACP_URL`, `WORKBUDDY_ACP_CWD`, `WORKBUDDY_ACP_TIMEOUT`, and `WORKBUDDY_ACP_MAX_ATTEMPTS`. A live discovered gateway takes precedence over a stale configured URL. Never commit gateway passwords or API keys.
+
+### Reliability and error semantics
+
+- Authentication and protocol/configuration errors stop immediately; transient network, timeout, capacity, and explicit refusal failures can be retried within `WORKBUDDY_ACP_MAX_ATTEMPTS`.
+- User cancellation and `max_tokens` terminal results are not automatically retried.
+- Cancelling a downstream request sends `session/cancel` when an ACP session exists, then closes the ACP connection.
+- Errors detected before streaming preserve their HTTP status where available instead of being presented as successful assistant text.
+- Mid-stream Chat failures are emitted as an OpenAI-style SSE `error` object and do not emit `[DONE]` as success.
+- Mid-stream Responses failures emit exactly one `response.failed`; successful Responses streams emit exactly one `response.completed`.
+- Malformed JSON, invalid SSE payloads, premature EOF, or `[DONE]` without a finish reason are treated as explicit failures.
 
 ---
 

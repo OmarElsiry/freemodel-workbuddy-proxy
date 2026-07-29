@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path
 from typing import AsyncIterator
-import uuid
 
 import httpx
+
+
+logger = logging.getLogger("freemodel-proxy.transport")
 
 
 @dataclass
@@ -21,7 +25,37 @@ class NormalizedEvent:
 
 
 class WorkBuddyAcpError(RuntimeError):
-    pass
+    """Sanitized ACP failure with routing and retry metadata."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "protocol",
+        retryable: bool = False,
+        status_code: int | None = None,
+    ):
+        super().__init__(message)
+        self.category = category
+        self.retryable = retryable
+        self.status_code = status_code
+
+    @classmethod
+    def from_http_status(cls, operation: str, status_code: int) -> "WorkBuddyAcpError":
+        if status_code in {401, 403}:
+            return cls(
+                f"WorkBuddy ACP {operation} authentication failed ({status_code})",
+                category="authentication",
+                status_code=status_code,
+            )
+        retryable = status_code in {408, 409, 425, 429} or status_code >= 500
+        category = "capacity" if status_code in {429, 503} else "upstream"
+        return cls(
+            f"WorkBuddy ACP {operation} failed ({status_code})",
+            category=category,
+            retryable=retryable,
+            status_code=status_code,
+        )
 
 
 def serialize_messages(messages: list[dict]) -> str:
@@ -65,20 +99,33 @@ class WorkBuddyAcpTransport:
         self.timeout = timeout
 
     @classmethod
-    def from_config(cls, config) -> "WorkBuddyAcpTransport":
-        configured_url = str(config.WORKBUDDY_ACP_URL or "").rstrip("/")
-        discovered_url, discovered_password = cls.discover()
-        base_url = discovered_url or configured_url
-        password = str(config.WORKBUDDY_ACP_PASSWORD or discovered_password)
-        if not base_url:
+    def from_config(cls, config, base_url: str | None = None) -> "WorkBuddyAcpTransport":
+        candidates = cls.candidate_urls(config)
+        selected_url = (base_url or (candidates[0] if candidates else "")).rstrip("/")
+        if not selected_url:
             raise WorkBuddyAcpError(
-                "No active WorkBuddy ACP gateway was found. Start WorkBuddy or set WORKBUDDY_ACP_URL."
+                "No active WorkBuddy ACP gateway was found. Start WorkBuddy or set WORKBUDDY_ACP_URL.",
+                category="configuration",
             )
         return cls(
-            base_url,
-            password,
+            selected_url,
+            str(config.WORKBUDDY_ACP_PASSWORD or cls._environment_password()),
             config.WORKBUDDY_ACP_CWD,
             config.WORKBUDDY_ACP_TIMEOUT,
+        )
+
+    @classmethod
+    def candidate_urls(cls, config) -> list[str]:
+        discovered = cls.discover_all()
+        configured = str(config.WORKBUDDY_ACP_URL or "").rstrip("/")
+        if configured and configured not in discovered:
+            discovered.append(configured)
+        return discovered
+
+    @staticmethod
+    def _environment_password() -> str:
+        return os.environ.get("WORKBUDDY_ACP_PASSWORD") or os.environ.get(
+            "CODEBUDDY_GATEWAY_PASSWORD", ""
         )
 
     @staticmethod
@@ -89,7 +136,7 @@ class WorkBuddyAcpTransport:
             return False
 
     @staticmethod
-    def discover(config_dir: Path | None = None) -> tuple[str, str]:
+    def discover_all(config_dir: Path | None = None) -> list[str]:
         root = config_dir or Path(os.environ.get("CODEBUDDY_CONFIG_DIR", Path.home() / ".workbuddy-ai"))
         sessions = root / "sessions"
         try:
@@ -99,7 +146,8 @@ class WorkBuddyAcpTransport:
                 reverse=True,
             )
         except OSError:
-            return "", ""
+            return []
+        urls = []
         for candidate in candidates:
             try:
                 data = json.loads(candidate.read_text(encoding="utf-8"))
@@ -108,12 +156,16 @@ class WorkBuddyAcpTransport:
             if not WorkBuddyAcpTransport._process_is_alive(data.get("pid")):
                 continue
             url = str(data.get("url") or data.get("endpoint") or "").rstrip("/")
-            if url:
-                password = os.environ.get("WORKBUDDY_ACP_PASSWORD") or os.environ.get(
-                    "CODEBUDDY_GATEWAY_PASSWORD", ""
-                )
-                return url, password
-        return "", ""
+            if url and url not in urls:
+                urls.append(url)
+        return urls
+
+    @staticmethod
+    def discover(config_dir: Path | None = None) -> tuple[str, str]:
+        urls = WorkBuddyAcpTransport.discover_all(config_dir)
+        if not urls:
+            return "", ""
+        return urls[0], WorkBuddyAcpTransport._environment_password()
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -135,9 +187,18 @@ class WorkBuddyAcpTransport:
             if not data:
                 continue
             try:
-                yield json.loads(data)
+                event = json.loads(data)
             except json.JSONDecodeError as exc:
-                raise WorkBuddyAcpError("Malformed JSON in WorkBuddy ACP stream") from exc
+                raise WorkBuddyAcpError(
+                    "Malformed JSON in WorkBuddy ACP stream",
+                    category="protocol",
+                ) from exc
+            if not isinstance(event, dict):
+                raise WorkBuddyAcpError(
+                    "Invalid JSON value in WorkBuddy ACP stream",
+                    category="protocol",
+                )
+            yield event
 
     async def _rpc_stream(
         self,
@@ -155,35 +216,96 @@ class WorkBuddyAcpTransport:
         payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         async with client.stream("POST", f"{self.base_url}/api/v1/acp", headers=headers, json=payload) as response:
             if response.status_code != 200:
-                body = (await response.aread()).decode("utf-8", errors="replace")
-                raise WorkBuddyAcpError(f"WorkBuddy ACP {method} failed ({response.status_code}): {body}")
+                await response.aread()
+                raise WorkBuddyAcpError.from_http_status(method, response.status_code)
             found_result = False
             async for event in self._read_sse_json(response):
                 if event.get("id") == request_id:
                     if "error" in event:
                         error = event.get("error") or {}
-                        raise WorkBuddyAcpError(str(error.get("message") or error))
+                        message = str(error.get("message") or "WorkBuddy ACP JSON-RPC error")
+                        lowered = message.lower()
+                        retryable = any(
+                            marker in lowered
+                            for marker in ("timeout", "temporarily", "capacity", "refusal", "network", "interrupted")
+                        )
+                        raise WorkBuddyAcpError(
+                            message,
+                            category="upstream",
+                            retryable=retryable,
+                        )
                     found_result = True
                 yield event
             if not found_result:
-                raise WorkBuddyAcpError(f"WorkBuddy ACP {method} ended without a result")
+                raise WorkBuddyAcpError(
+                    f"WorkBuddy ACP {method} ended without a result",
+                    category="protocol",
+                )
+
+    async def _cancel_session(
+        self,
+        client: httpx.AsyncClient,
+        connection_id: str,
+        session_token: str,
+        session_id: str,
+    ) -> None:
+        if not session_id:
+            return
+        try:
+            async for _ in self._rpc_stream(
+                client,
+                connection_id,
+                session_token,
+                4,
+                "session/cancel",
+                {"sessionId": session_id},
+            ):
+                pass
+        except Exception as exc:
+            logger.warning("WorkBuddy ACP session cancellation failed: %s", type(exc).__name__)
+
+    async def _close_connection(
+        self,
+        client: httpx.AsyncClient,
+        connection_id: str,
+        session_token: str,
+    ) -> None:
+        if not connection_id:
+            return
+        try:
+            await client.delete(
+                f"{self.base_url}/api/v1/acp",
+                headers={
+                    **self._headers(),
+                    "acp-connection-id": connection_id,
+                    "acp-session-token": session_token,
+                },
+            )
+        except Exception as exc:
+            logger.warning("WorkBuddy ACP connection cleanup failed: %s", type(exc).__name__)
 
     async def stream_chat(self, messages: list[dict]) -> AsyncIterator[NormalizedEvent]:
         prompt = serialize_messages(messages)
-        timeout = httpx.Timeout(self.timeout, connect=10.0)
+        timeout = httpx.Timeout(self.timeout, connect=10.0, write=30.0, pool=10.0)
+        connection_id = ""
+        session_token = ""
+        session_id = ""
         async with httpx.AsyncClient(timeout=timeout) as client:
-            headers = self._headers()
-            headers["Accept"] = "text/event-stream"
-            async with client.stream("GET", f"{self.base_url}/api/v1/acp", headers=headers) as response:
-                if response.status_code != 200:
-                    body = (await response.aread()).decode("utf-8", errors="replace")
-                    raise WorkBuddyAcpError(f"Cannot connect to WorkBuddy ACP ({response.status_code}): {body}")
-                connection_id = response.headers.get("acp-connection-id", "")
-                session_token = response.headers.get("acp-session-token", "")
-            if not connection_id:
-                raise WorkBuddyAcpError("WorkBuddy ACP did not provide a connection id")
-
             try:
+                headers = self._headers()
+                headers["Accept"] = "text/event-stream"
+                async with client.stream("GET", f"{self.base_url}/api/v1/acp", headers=headers) as response:
+                    if response.status_code != 200:
+                        await response.aread()
+                        raise WorkBuddyAcpError.from_http_status("connection", response.status_code)
+                    connection_id = response.headers.get("acp-connection-id", "")
+                    session_token = response.headers.get("acp-session-token", "")
+                if not connection_id:
+                    raise WorkBuddyAcpError(
+                        "WorkBuddy ACP did not provide a connection id",
+                        category="protocol",
+                    )
+
                 async for _ in self._rpc_stream(
                     client,
                     connection_id,
@@ -202,7 +324,6 @@ class WorkBuddyAcpTransport:
                 ):
                     pass
 
-                session_id = ""
                 async for event in self._rpc_stream(
                     client,
                     connection_id,
@@ -214,7 +335,10 @@ class WorkBuddyAcpTransport:
                     if event.get("id") == 2:
                         session_id = str((event.get("result") or {}).get("sessionId") or "")
                 if not session_id:
-                    raise WorkBuddyAcpError("WorkBuddy ACP did not create a session")
+                    raise WorkBuddyAcpError(
+                        "WorkBuddy ACP did not create a session",
+                        category="protocol",
+                    )
 
                 completed = False
                 async for event in self._rpc_stream(
@@ -234,19 +358,39 @@ class WorkBuddyAcpTransport:
                     elif event.get("id") == 3:
                         stop_reason = str((event.get("result") or {}).get("stopReason") or "")
                         if stop_reason != "end_turn":
-                            raise WorkBuddyAcpError(f"WorkBuddy ACP stopped with reason: {stop_reason or 'unknown'}")
+                            raise WorkBuddyAcpError(
+                                f"WorkBuddy ACP stopped with reason: {stop_reason or 'unknown'}",
+                                category="refusal" if stop_reason == "refusal" else "upstream",
+                                retryable=stop_reason == "refusal",
+                            )
                         completed = True
                 if not completed:
-                    raise WorkBuddyAcpError("WorkBuddy ACP prompt ended without completion")
-                yield NormalizedEvent("completed")
-            finally:
-                try:
-                    await client.delete(
-                        f"{self.base_url}/api/v1/acp",
-                        headers={**self._headers(), "acp-connection-id": connection_id, "acp-session-token": session_token},
+                    raise WorkBuddyAcpError(
+                        "WorkBuddy ACP prompt ended without completion",
+                        category="protocol",
                     )
-                except Exception:
-                    pass
+                yield NormalizedEvent("completed")
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    self._cancel_session(client, connection_id, session_token, session_id)
+                )
+                raise
+            except httpx.TimeoutException as exc:
+                raise WorkBuddyAcpError(
+                    "WorkBuddy ACP request timed out",
+                    category="timeout",
+                    retryable=True,
+                ) from exc
+            except httpx.RequestError as exc:
+                raise WorkBuddyAcpError(
+                    "WorkBuddy ACP connection failed",
+                    category="network",
+                    retryable=True,
+                ) from exc
+            finally:
+                await asyncio.shield(
+                    self._close_connection(client, connection_id, session_token)
+                )
 
     async def complete_chat(self, messages: list[dict]) -> str:
         parts = []
