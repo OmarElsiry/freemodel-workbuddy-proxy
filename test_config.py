@@ -26,6 +26,13 @@ def load_config(config_file: Path, environment: dict[str, str] | None = None):
             or module.DEFAULT_PUBLIC_BASE_URL
         ).rstrip("/")
         module.DEFAULT_API_KEY = os.environ.get("FREEMODEL_API_KEY") or module.load_saved_key()
+        module.TRANSPORT = str(
+            os.environ.get("FREEMODEL_TRANSPORT")
+            or module.load_saved_value(
+                "FREEMODEL_TRANSPORT",
+                "workbuddy_acp" if "work.freemodel.dev" in module.DEFAULT_BASE_URL else "http",
+            )
+        ).strip().lower()
     return module
 
 
@@ -65,6 +72,28 @@ class ConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(config.DEFAULT_BASE_URL, "https://environment.test/v1")
+
+    def test_protected_endpoint_defaults_to_workbuddy_acp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "config.json"
+            config_file.write_text(
+                json.dumps({"FREEMODEL_BASE_URL": "https://work.freemodel.dev/v1"}),
+                encoding="utf-8",
+            )
+            config = load_config(config_file)
+
+        self.assertEqual(config.TRANSPORT, "workbuddy_acp")
+
+    def test_transport_environment_overrides_saved_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "config.json"
+            config_file.write_text(
+                json.dumps({"FREEMODEL_TRANSPORT": "workbuddy_acp"}),
+                encoding="utf-8",
+            )
+            config = load_config(config_file, {"FREEMODEL_TRANSPORT": "http"})
+
+        self.assertEqual(config.TRANSPORT, "http")
 
     def test_reads_key_without_exposing_it_in_source(self):
         with tempfile.TemporaryDirectory() as directory:

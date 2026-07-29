@@ -32,17 +32,18 @@ def load_saved_key() -> str:
     return ""
 
 
-def load_saved_base_url() -> str:
+def load_saved_value(name: str, default=""):
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r") as f:
-                data = json.load(f)
-                base_url = data.get("FREEMODEL_BASE_URL", "").strip()
-                if base_url:
-                    return base_url
+                return json.load(f).get(name, default)
         except Exception:
             pass
-    return ""
+    return default
+
+
+def load_saved_base_url() -> str:
+    return str(load_saved_value("FREEMODEL_BASE_URL", "")).strip()
 
 
 def save_key(key: str):
@@ -63,6 +64,37 @@ DEFAULT_BASE_URL = (
     or DEFAULT_PUBLIC_BASE_URL
 ).rstrip("/")
 DEFAULT_API_KEY = os.environ.get("FREEMODEL_API_KEY") or load_saved_key()
+
+TRANSPORT = str(
+    os.environ.get("FREEMODEL_TRANSPORT")
+    or load_saved_value(
+        "FREEMODEL_TRANSPORT",
+        "workbuddy_acp" if "work.freemodel.dev" in DEFAULT_BASE_URL else "http",
+    )
+).strip().lower()
+if TRANSPORT not in {"http", "workbuddy_acp"}:
+    raise ValueError(f"Unsupported FREEMODEL_TRANSPORT: {TRANSPORT}")
+
+WORKBUDDY_ACP_URL = str(
+    os.environ.get("WORKBUDDY_ACP_URL")
+    or load_saved_value("WORKBUDDY_ACP_URL", "http://127.0.0.1:44741")
+).rstrip("/")
+WORKBUDDY_ACP_PASSWORD = str(
+    os.environ.get("WORKBUDDY_ACP_PASSWORD")
+    or load_saved_value("WORKBUDDY_ACP_PASSWORD", "")
+)
+WORKBUDDY_ACP_CWD = str(
+    os.environ.get("WORKBUDDY_ACP_CWD")
+    or load_saved_value("WORKBUDDY_ACP_CWD", str(Path(__file__).parent))
+)
+WORKBUDDY_ACP_TIMEOUT = float(
+    os.environ.get("WORKBUDDY_ACP_TIMEOUT")
+    or load_saved_value("WORKBUDDY_ACP_TIMEOUT", 180)
+)
+WORKBUDDY_ACP_MAX_ATTEMPTS = int(
+    os.environ.get("WORKBUDDY_ACP_MAX_ATTEMPTS")
+    or load_saved_value("WORKBUDDY_ACP_MAX_ATTEMPTS", 4)
+)
 
 CLIENT_HEADERS = {}
 

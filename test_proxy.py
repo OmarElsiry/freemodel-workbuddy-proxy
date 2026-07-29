@@ -6,7 +6,7 @@ import sys
 import os
 
 BASE_URL = "http://127.0.0.1:40589"
-TEST_API_KEY = "fe_oa_64748ef59ad0c85cb0da2f6a9f1ebc0fb3b2ca94fc05feb3"
+TEST_API_KEY = "sk-dummy"
 
 def run_tests():
     print("=== Starting Freemodel Proxy Tests ===")

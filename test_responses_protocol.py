@@ -30,7 +30,10 @@ class ResponsesProtocolTests(unittest.IsolatedAsyncioTestCase):
             transport=transport,
             base_url="http://testserver",
         ) as app_client:
-            with patch.object(proxy_server.httpx, "AsyncClient", self.client_factory(handler)):
+            with (
+                patch.object(proxy_server.config, "TRANSPORT", "http"),
+                patch.object(proxy_server.httpx, "AsyncClient", self.client_factory(handler)),
+            ):
                 return await app_client.post("/v1/responses", json=payload)
 
     @staticmethod

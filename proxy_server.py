@@ -19,6 +19,7 @@ from config import (
     DEFAULT_HOST,
     DEFAULT_PORT,
 )
+from upstream_transport import WorkBuddyAcpError, WorkBuddyAcpTransport
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("freemodel-proxy")
@@ -72,6 +73,45 @@ def upstream_headers(request: Request) -> dict[str, str]:
     if auth_header:
         headers["Authorization"] = auth_header
     return headers
+
+
+def workbuddy_transport() -> WorkBuddyAcpTransport:
+    return WorkBuddyAcpTransport.from_config(config)
+
+
+async def complete_workbuddy_chat(messages: list[dict]) -> str:
+    """Complete through ACP, retrying transient gateway/session failures before responding."""
+    errors = []
+    attempts = max(1, int(config.WORKBUDDY_ACP_MAX_ATTEMPTS))
+    for attempt in range(1, attempts + 1):
+        try:
+            return await workbuddy_transport().complete_chat(messages)
+        except WorkBuddyAcpError as exc:
+            errors.append(str(exc))
+            logger.warning(
+                "WorkBuddy ACP attempt %s/%s failed: %s",
+                attempt,
+                attempts,
+                exc,
+            )
+    detail = errors[-1] if errors else "unknown WorkBuddy ACP error"
+    raise WorkBuddyAcpError(f"WorkBuddy ACP failed after {attempts} attempts: {detail}")
+
+
+def chat_result(model: str, text: str) -> dict:
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+    }
 
 
 def text_from_content(content) -> str:
@@ -304,7 +344,12 @@ def error_json(status_code: int, message: str, error_type: str = "upstream_error
 @app.get("/")
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "freemodel-proxy", "upstream": config.DEFAULT_BASE_URL}
+    return {
+        "status": "ok",
+        "service": "freemodel-proxy",
+        "upstream": config.DEFAULT_BASE_URL,
+        "transport": config.TRANSPORT,
+    }
 
 
 @app.get("/v1/models")
@@ -324,7 +369,55 @@ async def chat_completions(request: Request):
     stream = body.get("stream", False)
     target_url = f"{config.DEFAULT_BASE_URL.rstrip('/')}/chat/completions"
     headers = upstream_headers(request)
-    logger.info("Proxying chat/completions (model=%s, stream=%s) -> %s", model, stream, target_url)
+    logger.info(
+        "Proxying chat/completions (model=%s, stream=%s, transport=%s)",
+        model,
+        stream,
+        config.TRANSPORT,
+    )
+
+    if config.TRANSPORT == "workbuddy_acp":
+        messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+        if stream:
+            async def acp_chat_stream():
+                completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+                try:
+                    text = await complete_workbuddy_chat(messages)
+                    if text:
+                        chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
+                    chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
+                except WorkBuddyAcpError as exc:
+                    logger.error("WorkBuddy ACP chat stream failed: %s", exc)
+                    chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": f"[WorkBuddy ACP Error]: {exc}"}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
+            return StreamingResponse(acp_chat_stream(), media_type="text/event-stream")
+        try:
+            text = await complete_workbuddy_chat(messages)
+            return JSONResponse(content=chat_result(model, text))
+        except WorkBuddyAcpError as exc:
+            return error_json(502, str(exc), "workbuddy_acp_error")
 
     if stream:
         async def stream_generator():
@@ -380,7 +473,85 @@ async def responses_endpoint(request: Request):
     chat_payload = build_chat_payload(body, model)
     target_url = f"{config.DEFAULT_BASE_URL.rstrip('/')}/chat/completions"
     headers = upstream_headers(request)
-    logger.info("Proxying responses (model=%s, stream=%s) -> %s", model, chat_payload["stream"], target_url)
+    logger.info(
+        "Proxying responses (model=%s, stream=%s, transport=%s)",
+        model,
+        chat_payload["stream"],
+        config.TRANSPORT,
+    )
+
+    if config.TRANSPORT == "workbuddy_acp":
+        if not chat_payload["stream"]:
+            try:
+                text = await complete_workbuddy_chat(chat_payload["messages"])
+                return JSONResponse(content=chat_completion_to_response(chat_result(model, text), model))
+            except WorkBuddyAcpError as exc:
+                return error_json(502, str(exc), "workbuddy_acp_error")
+
+        response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        async def acp_responses_stream():
+            sequence_number = 0
+            text_parts = []
+
+            def emit(event_type: str, **payload) -> bytes:
+                nonlocal sequence_number
+                event = sse_event(event_type, {"sequence_number": sequence_number, **payload})
+                sequence_number += 1
+                return event
+
+            yield emit("response.created", response=base_response(response_id, model, "in_progress", []))
+            started = False
+            try:
+                text = await complete_workbuddy_chat(chat_payload["messages"])
+                if not started:
+                    started = True
+                    yield emit(
+                        "response.output_item.added",
+                        output_index=0,
+                        item={
+                            "id": message_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    )
+                if text:
+                    text_parts.append(text)
+                    yield emit(
+                        "response.output_text.delta",
+                        item_id=message_id,
+                        output_index=0,
+                        content_index=0,
+                        delta=text,
+                    )
+                item = message_output_item("".join(text_parts), message_id)
+                yield emit(
+                    "response.output_text.done",
+                    item_id=message_id,
+                    output_index=0,
+                    content_index=0,
+                    text=item["content"][0]["text"],
+                )
+                yield emit("response.output_item.done", output_index=0, item=item)
+                yield emit(
+                    "response.completed",
+                    response=base_response(response_id, model, "completed", [item]),
+                )
+                return
+            except Exception as exc:
+                logger.error("WorkBuddy ACP Responses stream failed: %s", exc)
+                failed = base_response(response_id, model, "failed", [])
+                failed["error"] = {"code": "workbuddy_acp_error", "message": str(exc)}
+                yield emit("response.failed", response=failed)
+
+        return StreamingResponse(
+            acp_responses_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
 
     if not chat_payload["stream"]:
         try:

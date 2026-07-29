@@ -12,6 +12,35 @@ A high-performance, OpenAI-compatible proxy server and Terminal User Interface (
 - 🔄 **Native Responses Streaming**: Translates Chat Completions SSE into Responses API events, including the terminal `response.completed` event required by Codex.
 - 🧰 **Function Tool Translation**: Converts Responses function definitions, calls, and outputs to and from Chat Completions tool-call format.
 - 🛡️ **Explicit Stream Failures**: Reports truncated upstream streams as `response.failed` instead of silently closing before completion.
+- 🔐 **Official WorkBuddy ACP Transport**: Routes the protected `work.freemodel.dev` endpoint through an active official WorkBuddy gateway instead of imitating private client authentication.
+- 🧭 **Dynamic Gateway Discovery**: Finds a live gateway from `~/.workbuddy-ai/sessions` and skips stale session registrations.
+
+---
+
+## 🔀 Transport Configuration
+
+The proxy supports two transports:
+
+- `http`: Direct OpenAI-compatible HTTP, used by the public Freemodel endpoint and other generic upstreams.
+- `workbuddy_acp`: Official WorkBuddy ACP, required for the protected `https://work.freemodel.dev/v1` endpoint.
+
+Example ignored local `config.json`:
+
+```json
+{
+  "FREEMODEL_BASE_URL": "https://work.freemodel.dev/v1",
+  "FREEMODEL_TRANSPORT": "workbuddy_acp"
+}
+```
+
+Start WorkBuddy before the proxy. Supply gateway authentication only through the environment:
+
+```bash
+export WORKBUDDY_ACP_PASSWORD="$CODEBUDDY_GATEWAY_PASSWORD"
+python3 proxy_server.py
+```
+
+Optional settings are `WORKBUDDY_ACP_URL`, `WORKBUDDY_ACP_CWD`, `WORKBUDDY_ACP_TIMEOUT`, and `WORKBUDDY_ACP_MAX_ATTEMPTS`. A live discovered gateway takes precedence over a stale configured URL. Never commit gateway passwords or API keys.
 
 ---
 
