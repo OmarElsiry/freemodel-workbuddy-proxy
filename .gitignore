@@ -8,9 +8,11 @@ config.json
 .env
 .env.*
 
-# Logs
+# Logs and proxy-owned runtime state
 *.log
 proxy_server.log
+.proxy-sessions.json
+.proxy-runtime/
 
 # Environments
 .venv/

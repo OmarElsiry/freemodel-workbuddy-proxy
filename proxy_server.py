@@ -2,7 +2,7 @@
 
 import asyncio
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 import getpass
@@ -12,21 +12,53 @@ import logging
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager, suppress
 
 import config
 from config import (
     AVAILABLE_MODELS,
     CLIENT_HEADERS,
-    DEFAULT_BASE_URL,
     DEFAULT_HOST,
     DEFAULT_PORT,
 )
-from upstream_transport import WorkBuddyAcpError, WorkBuddyAcpTransport
+from session_store import SessionStore, canonical_project
+from sidecar_manager import SidecarError, SidecarManager
+from upstream_transport import NormalizedEvent, WorkBuddyAcpError, WorkBuddyAcpTransport
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("freemodel-proxy")
 
-app = FastAPI(title="Freemodel API Proxy", version="1.1.0")
+session_store = SessionStore(config.PROXY_SESSION_STORE, config.PROXY_MAX_HISTORY_TURNS)
+sidecar_manager = SidecarManager(
+    session_store,
+    config.WORKBUDDY_CLI_PATH,
+    config.PROXY_RUNTIME_DIR,
+    config.PROXY_SIDECAR_STARTUP_TIMEOUT,
+    config.PROXY_SIDECAR_IDLE_TIMEOUT,
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await session_store.clear_stale_runtime()
+
+    async def idle_reaper():
+        interval = max(1.0, min(30.0, config.PROXY_SIDECAR_IDLE_TIMEOUT or 30.0))
+        while True:
+            await asyncio.sleep(interval)
+            await sidecar_manager.reap_idle()
+
+    reaper = asyncio.create_task(idle_reaper())
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        with suppress(asyncio.CancelledError):
+            await reaper
+        await sidecar_manager.stop_all()
+
+
+app = FastAPI(title="Freemodel API Proxy", version="1.2.0", lifespan=lifespan)
 
 # The official ACP gateway can cross-wire concurrent sessions on the same
 # gateway process. Serialize work per gateway while still allowing requests
@@ -82,8 +114,11 @@ def upstream_headers(request: Request) -> dict[str, str]:
     return headers
 
 
-def workbuddy_transport(base_url: str | None = None) -> WorkBuddyAcpTransport:
-    return WorkBuddyAcpTransport.from_config(config, base_url=base_url)
+def workbuddy_transport(base_url: str | None = None, cwd: str | None = None) -> WorkBuddyAcpTransport:
+    transport = WorkBuddyAcpTransport.from_config(config, base_url=base_url)
+    if cwd:
+        transport.cwd = cwd
+    return transport
 
 
 def workbuddy_gateway_lock(base_url: str) -> asyncio.Lock:
@@ -94,37 +129,68 @@ def workbuddy_gateway_lock(base_url: str) -> asyncio.Lock:
     return lock
 
 
-async def complete_workbuddy_chat(messages: list[dict]) -> str:
-    """Complete through ACP with classified retries rotating live gateways."""
-    candidates = WorkBuddyAcpTransport.candidate_urls(config)
-    if not candidates:
-        candidates = [None]
+async def stream_workbuddy_chat(
+    messages: list[dict],
+    *,
+    gateway_url: str | None = None,
+    project: str | None = None,
+):
+    """Stream ACP events, retrying only before any downstream-visible delta."""
+    candidates = [gateway_url] if gateway_url else (WorkBuddyAcpTransport.candidate_urls(config) or [None])
     attempts = max(1, int(config.WORKBUDDY_ACP_MAX_ATTEMPTS))
     last_error = None
+    emitted = False
+
     for attempt in range(attempts):
         candidate = candidates[attempt % len(candidates)]
+        stream = None
         try:
-            transport = workbuddy_transport(candidate)
+            transport = workbuddy_transport(candidate, cwd=project)
             async with workbuddy_gateway_lock(transport.base_url):
-                return await transport.complete_chat(messages)
+                stream = transport.stream_chat(messages)
+                async for event in stream:
+                    if event.type == "text_delta":
+                        emitted = True
+                    yield event
+                return
         except WorkBuddyAcpError as exc:
             last_error = exc
             logger.warning(
-                "WorkBuddy ACP attempt %s/%s failed (%s, retryable=%s)",
+                "WorkBuddy ACP attempt %s/%s failed (%s, retryable=%s, emitted=%s)",
                 attempt + 1,
                 attempts,
                 exc.category,
                 exc.retryable,
+                emitted,
             )
-            if not exc.retryable:
+            if emitted or not exc.retryable:
                 raise
+        finally:
+            if stream is not None:
+                await stream.aclose()
+
     if last_error is None:
         raise WorkBuddyAcpError("WorkBuddy ACP failed", category="upstream")
     raise WorkBuddyAcpError(
         f"WorkBuddy ACP failed after {attempts} attempts: {last_error}",
         category=last_error.category,
+        retryable=False,
         status_code=last_error.status_code,
     )
+
+
+async def complete_workbuddy_chat(
+    messages: list[dict],
+    *,
+    gateway_url: str | None = None,
+    project: str | None = None,
+) -> str:
+    """Collect the shared incremental ACP stream for non-streaming requests."""
+    parts = []
+    async for event in stream_workbuddy_chat(messages, gateway_url=gateway_url, project=project):
+        if event.type == "text_delta":
+            parts.append(event.text)
+    return "".join(parts)
 
 
 def chat_result(model: str, text: str) -> dict:
@@ -383,6 +449,121 @@ def chat_sse_error(message: str, code: str = "proxy_stream_error") -> bytes:
     return f"data: {json.dumps(error_payload(message, 'proxy_error', code), separators=(',', ':'))}\n\n".encode()
 
 
+class UpstreamStreamError(RuntimeError):
+    def __init__(self, message: str, code: str = "upstream_stream_error"):
+        super().__init__(message)
+        self.code = code
+
+
+async def iter_chat_sse(response: httpx.Response):
+    """Parse Chat Completions SSE and produce one explicit completion event."""
+    saw_event = False
+    saw_terminal = False
+    async for line in response.aiter_lines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(":") or not stripped.startswith("data:"):
+            continue
+        data = stripped[5:].strip()
+        if not data:
+            continue
+        if data == "[DONE]":
+            if not saw_terminal:
+                raise UpstreamStreamError(
+                    "Upstream stream ended without a finish reason",
+                    "upstream_stream_incomplete",
+                )
+            yield "completed", None
+            return
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise UpstreamStreamError(
+                "Malformed JSON in upstream SSE",
+                "malformed_upstream_sse",
+            ) from exc
+        if not isinstance(chunk, dict):
+            raise UpstreamStreamError(
+                "Invalid upstream SSE payload",
+                "malformed_upstream_sse",
+            )
+        if chunk.get("error"):
+            upstream_error = chunk.get("error") or {}
+            raise UpstreamStreamError(
+                str(upstream_error.get("message") or "Upstream stream failed"),
+                str(upstream_error.get("code") or "upstream_stream_error"),
+            )
+        saw_event = True
+        for choice in chunk.get("choices") or []:
+            if isinstance(choice, dict) and choice.get("finish_reason") is not None:
+                saw_terminal = True
+        yield "chunk", chunk
+    if not saw_event or not saw_terminal:
+        raise UpstreamStreamError(
+            "Upstream stream ended without a completion marker",
+            "upstream_stream_incomplete",
+        )
+    yield "completed", None
+
+
+def validate_chat_body(body) -> str | None:
+    if not isinstance(body, dict):
+        return "Request body must be a JSON object"
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return "messages must be a non-empty array"
+    if not all(isinstance(message, dict) and message.get("role") for message in messages):
+        return "each message must be an object with a role"
+    return None
+
+
+def validate_responses_body(body) -> str | None:
+    if not isinstance(body, dict):
+        return "Request body must be a JSON object"
+    if not any(key in body for key in ("input", "messages", "prompt")):
+        return "one of input, messages, or prompt is required"
+    if "messages" in body and not isinstance(body["messages"], list):
+        return "messages must be an array"
+    return None
+
+
+def require_local_request(request: Request) -> JSONResponse | None:
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "testclient"}:
+        return error_json(403, "Proxy session management is loopback-only", "permission_error")
+    return None
+
+
+async def resolve_proxy_session(request: Request, messages: list[dict]) -> tuple[dict, str]:
+    requested_id = request.headers.get("x-workbuddy-session", "").strip()
+    project_hint = request.headers.get("x-workbuddy-project", "").strip() or config.PROXY_DEFAULT_PROJECT
+    try:
+        project = canonical_project(project_hint)
+    except ValueError as exc:
+        raise WorkBuddyAcpError(str(exc), category="configuration", status_code=400) from exc
+
+    if requested_id:
+        try:
+            session = await session_store.get(requested_id)
+        except ValueError as exc:
+            raise WorkBuddyAcpError(str(exc), category="configuration", status_code=400) from exc
+        if not session:
+            raise WorkBuddyAcpError("Unknown proxy session", category="configuration", status_code=404)
+        if session["project"] != project:
+            raise WorkBuddyAcpError(
+                "Proxy session belongs to a different project",
+                category="configuration",
+                status_code=409,
+            )
+    else:
+        session = await session_store.get_or_create_automatic(project, messages)
+
+    try:
+        gateway_url = await sidecar_manager.ensure(session)
+    except SidecarError as exc:
+        raise WorkBuddyAcpError(str(exc), category="configuration", status_code=503) from exc
+    return session, gateway_url
+
+
 @app.get("/")
 @app.get("/health")
 async def health_check():
@@ -399,12 +580,89 @@ async def list_models():
     return {"object": "list", "data": AVAILABLE_MODELS}
 
 
+@app.get("/proxy/sessions")
+async def list_proxy_sessions(request: Request, project: str | None = None):
+    denied = require_local_request(request)
+    if denied:
+        return denied
+    try:
+        return {"object": "list", "data": await session_store.list(project)}
+    except ValueError as exc:
+        return error_json(400, str(exc), "invalid_request_error")
+
+
+@app.post("/proxy/sessions")
+async def create_proxy_session(request: Request):
+    denied = require_local_request(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("Request body must be a JSON object")
+        session = await session_store.create(body.get("project", ""), body.get("title", ""))
+        return JSONResponse(status_code=201, content=session)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return error_json(400, str(exc), "invalid_request_error")
+
+
+@app.get("/proxy/sessions/{session_id}")
+async def get_proxy_session(session_id: str, request: Request):
+    denied = require_local_request(request)
+    if denied:
+        return denied
+    try:
+        session = await session_store.get(session_id)
+    except ValueError as exc:
+        return error_json(400, str(exc), "invalid_request_error")
+    if not session:
+        return error_json(404, "Unknown proxy session", "not_found_error")
+    return session
+
+
+@app.post("/proxy/sessions/{session_id}/history")
+async def append_proxy_session_history(session_id: str, request: Request):
+    denied = require_local_request(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("Request body must be a JSON object")
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("messages must be an array")
+        return await session_store.append_history(session_id, messages)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return error_json(400, str(exc), "invalid_request_error")
+    except KeyError:
+        return error_json(404, "Unknown proxy session", "not_found_error")
+
+
+@app.delete("/proxy/sessions/{session_id}")
+async def delete_proxy_session(session_id: str, request: Request):
+    denied = require_local_request(request)
+    if denied:
+        return denied
+    try:
+        await sidecar_manager.stop(session_id)
+        deleted = await session_store.delete(session_id)
+    except ValueError as exc:
+        return error_json(400, str(exc), "invalid_request_error")
+    if not deleted:
+        return error_json(404, "Unknown proxy session", "not_found_error")
+    return {"deleted": True, "id": session_id}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
         body = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
+    except Exception:
+        return error_json(400, "Invalid JSON payload", "invalid_request_error")
+    validation_error = validate_chat_body(body)
+    if validation_error:
+        return error_json(400, validation_error, "invalid_request_error")
 
     model = normalize_model(body.get("model"))
     body["model"] = model
@@ -420,37 +678,92 @@ async def chat_completions(request: Request):
 
     if config.TRANSPORT == "workbuddy_acp":
         messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+        try:
+            proxy_session, gateway_url = await resolve_proxy_session(request, messages)
+        except WorkBuddyAcpError as exc:
+            return acp_error_response(exc)
+        session_headers = {"X-WorkBuddy-Session": proxy_session["id"]}
         if stream:
+            acp_events = stream_workbuddy_chat(
+                messages,
+                gateway_url=gateway_url,
+                project=proxy_session["project"],
+            )
             try:
-                text = await complete_workbuddy_chat(messages)
+                first_event = await anext(acp_events)
+            except StopAsyncIteration:
+                await acp_events.aclose()
+                return error_json(502, "WorkBuddy ACP ended without completion", "workbuddy_acp_error")
             except WorkBuddyAcpError as exc:
+                await acp_events.aclose()
                 return acp_error_response(exc)
 
             async def acp_chat_stream():
                 completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-                if text:
-                    chunk = {
+                completed = False
+
+                def chunk(delta: dict, finish_reason=None) -> bytes:
+                    payload = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": model,
-                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
                     }
-                    yield f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
-                chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                }
-                yield f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
-                yield b"data: [DONE]\n\n"
+                    return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
 
-            return StreamingResponse(acp_chat_stream(), media_type="text/event-stream")
+                async def emit_event(event: NormalizedEvent):
+                    nonlocal completed
+                    if event.type == "text_delta" and event.text:
+                        yield chunk({"content": event.text})
+                    elif event.type == "completed":
+                        completed = True
+                        yield chunk({}, "stop")
+                        yield b"data: [DONE]\n\n"
+
+                try:
+                    async for payload in emit_event(first_event):
+                        yield payload
+                    if not completed:
+                        async for event in acp_events:
+                            if await request.is_disconnected():
+                                raise asyncio.CancelledError
+                            async for payload in emit_event(event):
+                                yield payload
+                            if completed:
+                                return
+                    if not completed:
+                        yield chat_sse_error(
+                            "WorkBuddy ACP ended without completion",
+                            "upstream_stream_incomplete",
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except WorkBuddyAcpError as exc:
+                    yield chat_sse_error(str(exc), f"workbuddy_acp_{exc.category}")
+                except Exception:
+                    logger.exception("WorkBuddy ACP Chat stream failed")
+                    yield chat_sse_error("WorkBuddy ACP stream failed", "workbuddy_acp_error")
+                finally:
+                    await acp_events.aclose()
+
+            return StreamingResponse(
+                acp_chat_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    **session_headers,
+                },
+            )
         try:
-            text = await complete_workbuddy_chat(messages)
-            return JSONResponse(content=chat_result(model, text))
+            text = await complete_workbuddy_chat(
+                messages,
+                gateway_url=gateway_url,
+                project=proxy_session["project"],
+            )
+            return JSONResponse(content=chat_result(model, text), headers=session_headers)
         except WorkBuddyAcpError as exc:
             return acp_error_response(exc)
 
@@ -475,69 +788,47 @@ async def chat_completions(request: Request):
             return JSONResponse(status_code=status_code, content=content)
 
         async def stream_generator():
-            saw_terminal = False
             try:
-                async for line in upstream_response.aiter_lines():
+                async for event_type, chunk in iter_chat_sse(upstream_response):
                     if await request.is_disconnected():
                         raise asyncio.CancelledError
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    if not stripped.startswith("data:"):
-                        continue
-                    data = stripped[5:].strip()
-                    if data == "[DONE]":
-                        if not saw_terminal:
-                            yield chat_sse_error(
-                                "Upstream stream ended without a finish reason",
-                                "upstream_stream_incomplete",
-                            )
-                        else:
-                            yield b"data: [DONE]\n\n"
+                    if event_type == "chunk":
+                        yield f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
+                    elif event_type == "completed":
+                        yield b"data: [DONE]\n\n"
                         return
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        yield chat_sse_error("Malformed upstream SSE", "malformed_upstream_sse")
-                        return
-                    if isinstance(chunk, dict) and chunk.get("error"):
-                        message = str((chunk.get("error") or {}).get("message") or "Upstream stream failed")
-                        yield chat_sse_error(message, "upstream_stream_error")
-                        return
-                    if not isinstance(chunk, dict):
-                        yield chat_sse_error("Invalid upstream SSE payload", "malformed_upstream_sse")
-                        return
-                    for choice in chunk.get("choices") or []:
-                        if choice.get("finish_reason") is not None:
-                            saw_terminal = True
-                    yield f"data: {json.dumps(chunk, separators=(',', ':'))}\n\n".encode()
-                if not saw_terminal:
-                    yield chat_sse_error(
-                        "Upstream stream ended without a completion marker",
-                        "upstream_stream_incomplete",
-                    )
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                logger.error("Upstream chat stream failed: %s", type(exc).__name__)
+            except UpstreamStreamError as exc:
+                yield chat_sse_error(str(exc), exc.code)
+            except Exception:
+                logger.exception("Upstream chat stream failed")
                 yield chat_sse_error("Upstream stream failed", "proxy_stream_error")
             finally:
                 await upstream_response.aclose()
                 await client.aclose()
 
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(target_url, json=body, headers=headers)
-    except Exception as exc:
-        logger.error("Upstream request exception: %s", type(exc).__name__)
+    except httpx.TimeoutException:
+        return error_json(504, "Upstream request timed out", "proxy_error")
+    except httpx.RequestError:
         return error_json(502, "Unable to connect to upstream", "proxy_error")
 
     try:
-        return JSONResponse(status_code=response.status_code, content=response.json())
+        result = response.json()
     except Exception:
-        return error_json(response.status_code, response.text)
+        if response.status_code >= 400:
+            return error_json(response.status_code, "Upstream request failed", "upstream_error")
+        return error_json(502, "Upstream returned invalid JSON", "upstream_error")
+    return JSONResponse(status_code=response.status_code, content=result)
 
 
 @app.post("/v1/responses")
@@ -545,8 +836,11 @@ async def responses_endpoint(request: Request):
     """Adapt the OpenAI Responses API to the upstream Chat Completions API."""
     try:
         body = await request.json()
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
+    except Exception:
+        return error_json(400, "Invalid JSON payload", "invalid_request_error")
+    validation_error = validate_responses_body(body)
+    if validation_error:
+        return error_json(400, validation_error, "invalid_request_error")
 
     model = normalize_model(body.get("model"))
     chat_payload = build_chat_payload(body, model)
@@ -560,24 +854,45 @@ async def responses_endpoint(request: Request):
     )
 
     if config.TRANSPORT == "workbuddy_acp":
+        try:
+            proxy_session, gateway_url = await resolve_proxy_session(request, chat_payload["messages"])
+        except WorkBuddyAcpError as exc:
+            return acp_error_response(exc)
+        session_headers = {"X-WorkBuddy-Session": proxy_session["id"]}
         if not chat_payload["stream"]:
             try:
-                text = await complete_workbuddy_chat(chat_payload["messages"])
-                return JSONResponse(content=chat_completion_to_response(chat_result(model, text), model))
+                text = await complete_workbuddy_chat(
+                    chat_payload["messages"],
+                    gateway_url=gateway_url,
+                    project=proxy_session["project"],
+                )
+                return JSONResponse(
+                    content=chat_completion_to_response(chat_result(model, text), model),
+                    headers=session_headers,
+                )
             except WorkBuddyAcpError as exc:
-                return error_json(502, str(exc), "workbuddy_acp_error")
+                return acp_error_response(exc)
 
         response_id = f"resp_{uuid.uuid4().hex[:24]}"
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
-
+        acp_events = stream_workbuddy_chat(
+            chat_payload["messages"],
+            gateway_url=gateway_url,
+            project=proxy_session["project"],
+        )
         try:
-            acp_text = await complete_workbuddy_chat(chat_payload["messages"])
+            first_event = await anext(acp_events)
+        except StopAsyncIteration:
+            await acp_events.aclose()
+            return error_json(502, "WorkBuddy ACP ended without completion", "workbuddy_acp_error")
         except WorkBuddyAcpError as exc:
+            await acp_events.aclose()
             return acp_error_response(exc)
 
         async def acp_responses_stream():
             sequence_number = 0
             text_parts = []
+            completed = False
 
             def emit(event_type: str, **payload) -> bytes:
                 nonlocal sequence_number
@@ -585,70 +900,104 @@ async def responses_endpoint(request: Request):
                 sequence_number += 1
                 return event
 
+            def failed_event(code: str, message: str) -> bytes:
+                failed = base_response(response_id, model, "failed", [])
+                failed["error"] = {"code": code, "message": message}
+                return emit("response.failed", response=failed)
+
             yield emit("response.created", response=base_response(response_id, model, "in_progress", []))
-            started = False
-            try:
-                text = acp_text
-                if not started:
-                    started = True
-                    yield emit(
-                        "response.output_item.added",
-                        output_index=0,
-                        item={
-                            "id": message_id,
-                            "type": "message",
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [],
-                        },
-                    )
-                if text:
-                    text_parts.append(text)
+            yield emit(
+                "response.output_item.added",
+                output_index=0,
+                item={
+                    "id": message_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            )
+
+            async def handle_event(event: NormalizedEvent):
+                nonlocal completed
+                if event.type == "text_delta" and event.text:
+                    text_parts.append(event.text)
                     yield emit(
                         "response.output_text.delta",
                         item_id=message_id,
                         output_index=0,
                         content_index=0,
-                        delta=text,
+                        delta=event.text,
                     )
-                item = message_output_item("".join(text_parts), message_id)
-                yield emit(
-                    "response.output_text.done",
-                    item_id=message_id,
-                    output_index=0,
-                    content_index=0,
-                    text=item["content"][0]["text"],
-                )
-                yield emit("response.output_item.done", output_index=0, item=item)
-                yield emit(
-                    "response.completed",
-                    response=base_response(response_id, model, "completed", [item]),
-                )
-                return
-            except Exception as exc:
-                logger.error("WorkBuddy ACP Responses stream failed: %s", exc)
-                failed = base_response(response_id, model, "failed", [])
-                failed["error"] = {"code": "workbuddy_acp_error", "message": str(exc)}
-                yield emit("response.failed", response=failed)
+                elif event.type == "completed":
+                    completed = True
+                    text = "".join(text_parts)
+                    item = message_output_item(text, message_id)
+                    yield emit(
+                        "response.output_text.done",
+                        item_id=message_id,
+                        output_index=0,
+                        content_index=0,
+                        text=text,
+                    )
+                    yield emit("response.output_item.done", output_index=0, item=item)
+                    yield emit(
+                        "response.completed",
+                        response=base_response(response_id, model, "completed", [item]),
+                    )
+
+            try:
+                async for payload in handle_event(first_event):
+                    yield payload
+                if not completed:
+                    async for event in acp_events:
+                        if await request.is_disconnected():
+                            raise asyncio.CancelledError
+                        async for payload in handle_event(event):
+                            yield payload
+                        if completed:
+                            return
+                if not completed:
+                    yield failed_event(
+                        "upstream_stream_incomplete",
+                        "WorkBuddy ACP ended without completion",
+                    )
+            except asyncio.CancelledError:
+                raise
+            except WorkBuddyAcpError as exc:
+                yield failed_event(f"workbuddy_acp_{exc.category}", str(exc))
+            except Exception:
+                logger.exception("WorkBuddy ACP Responses stream failed")
+                yield failed_event("workbuddy_acp_error", "WorkBuddy ACP stream failed")
+            finally:
+                await acp_events.aclose()
 
         return StreamingResponse(
             acp_responses_stream(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                **session_headers,
+            },
         )
 
     if not chat_payload["stream"]:
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(target_url, json=chat_payload, headers=headers)
-        except Exception as exc:
-            logger.error("Upstream responses request exception: %s", type(exc).__name__)
+        except httpx.TimeoutException:
+            return error_json(504, "Upstream request timed out", "proxy_error")
+        except httpx.RequestError:
             return error_json(502, "Unable to connect to upstream", "proxy_error")
 
         try:
             result = response.json()
         except Exception:
-            return error_json(response.status_code, response.text)
+            if response.status_code >= 400:
+                return error_json(response.status_code, "Upstream request failed", "upstream_error")
+            return error_json(502, "Upstream returned invalid JSON", "upstream_error")
         if response.status_code != 200:
             return JSONResponse(status_code=response.status_code, content=result)
         return JSONResponse(content=chat_completion_to_response(result, model))
@@ -696,47 +1045,17 @@ async def responses_endpoint(request: Request):
         yield emit("response.created", response=created_response)
 
         try:
-            async for line in upstream_response.aiter_lines():
-                line = line.strip()
-                if not line or not line.startswith("data:"):
-                    continue
+            async for event_type, chunk in iter_chat_sse(upstream_response):
                 if await request.is_disconnected():
                     raise asyncio.CancelledError
-                data = line[5:].strip()
-                if data == "[DONE]":
+                if event_type == "completed":
+                    saw_terminal_marker = True
                     break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    reason = "Malformed JSON in upstream SSE"
-                    failed_response = base_response(response_id, model, "failed", [])
-                    failed_response["error"] = {"code": "malformed_upstream_sse", "message": reason}
-                    yield emit("response.failed", response=failed_response)
-                    return
-                if not isinstance(chunk, dict):
-                    failed_response = base_response(response_id, model, "failed", [])
-                    failed_response["error"] = {
-                        "code": "malformed_upstream_sse",
-                        "message": "Invalid upstream SSE payload",
-                    }
-                    yield emit("response.failed", response=failed_response)
-                    return
-                if chunk.get("error"):
-                    upstream_error = chunk.get("error") or {}
-                    failed_response = base_response(response_id, model, "failed", [])
-                    failed_response["error"] = {
-                        "code": str(upstream_error.get("code") or "upstream_stream_error"),
-                        "message": str(upstream_error.get("message") or "Upstream stream failed"),
-                    }
-                    yield emit("response.failed", response=failed_response)
-                    return
 
                 saw_upstream_event = True
                 if isinstance(chunk.get("usage"), dict):
                     usage = chunk["usage"]
                 for choice in chunk.get("choices") or []:
-                    if choice.get("finish_reason") is not None:
-                        saw_terminal_marker = True
                     delta = choice.get("delta") or {}
                     content_delta = text_from_content(delta.get("content"))
                     if content_delta:
@@ -811,8 +1130,12 @@ async def responses_endpoint(request: Request):
             yield emit("response.completed", response=completed_response)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.error("Error translating upstream Responses stream: %s", type(exc).__name__)
+        except UpstreamStreamError as exc:
+            failed_response = base_response(response_id, model, "failed", [])
+            failed_response["error"] = {"code": exc.code, "message": str(exc)}
+            yield emit("response.failed", response=failed_response)
+        except Exception:
+            logger.exception("Error translating upstream Responses stream")
             failed_response = base_response(response_id, model, "failed", [])
             failed_response["error"] = {
                 "code": "proxy_stream_error",

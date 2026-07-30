@@ -8,7 +8,7 @@ from unittest.mock import patch
 import httpx
 
 import proxy_server
-from upstream_transport import WorkBuddyAcpError
+from upstream_transport import NormalizedEvent, WorkBuddyAcpError
 
 
 class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
@@ -87,7 +87,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
             active = 0
             max_active = 0
 
-            async def complete_chat(self, messages):
+            async def stream_chat(self, messages):
                 FakeTransport.active += 1
                 FakeTransport.max_active = max(
                     FakeTransport.max_active,
@@ -95,7 +95,8 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
                 )
                 try:
                     await asyncio.sleep(0.01)
-                    return messages[0]["content"]
+                    yield NormalizedEvent("text_delta", text=messages[0]["content"])
+                    yield NormalizedEvent("completed")
                 finally:
                     FakeTransport.active -= 1
 
@@ -129,12 +130,66 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, ["one", "two", "three"])
         self.assertEqual(FakeTransport.max_active, 1)
 
+    async def test_acp_requests_on_distinct_sidecars_can_overlap(self):
+        class FakeTransport:
+            active = 0
+            max_active = 0
+
+            def __init__(self, base_url):
+                self.base_url = base_url
+
+            async def stream_chat(self, messages):
+                FakeTransport.active += 1
+                FakeTransport.max_active = max(FakeTransport.max_active, FakeTransport.active)
+                try:
+                    await asyncio.sleep(0.01)
+                    yield NormalizedEvent("text_delta", text=messages[0]["content"])
+                    yield NormalizedEvent("completed")
+                finally:
+                    FakeTransport.active -= 1
+
+        proxy_server._workbuddy_gateway_locks.clear()
+        with (
+            patch.object(
+                proxy_server,
+                "workbuddy_transport",
+                side_effect=lambda base_url, cwd=None: FakeTransport(base_url),
+            ),
+            patch.object(proxy_server.config, "WORKBUDDY_ACP_MAX_ATTEMPTS", 1),
+        ):
+            results = await asyncio.gather(
+                proxy_server.complete_workbuddy_chat(
+                    [{"role": "user", "content": "one"}],
+                    gateway_url="http://sidecar-one",
+                ),
+                proxy_server.complete_workbuddy_chat(
+                    [{"role": "user", "content": "two"}],
+                    gateway_url="http://sidecar-two",
+                ),
+            )
+
+        self.assertEqual(results, ["one", "two"])
+        self.assertEqual(FakeTransport.max_active, 2)
+
     async def test_acp_stream_failure_is_http_error_not_assistant_text(self):
         async def unused_handler(request):
             raise AssertionError("HTTP transport should not be used")
 
-        error = WorkBuddyAcpError("gateway refused", category="authentication", status_code=403)
-        with patch.object(proxy_server, "complete_workbuddy_chat", side_effect=error):
+        async def failed_stream(messages, **kwargs):
+            raise WorkBuddyAcpError("gateway refused", category="authentication", status_code=403)
+            yield
+
+        with (
+            patch.object(
+                proxy_server,
+                "resolve_proxy_session",
+                return_value=(
+                    {"id": "proxy-test", "project": "/tmp/project"},
+                    "http://isolated-sidecar",
+                ),
+            ),
+            patch.object(proxy_server, "stream_workbuddy_chat", side_effect=failed_stream),
+        ):
             response = await self.call_app(
                 {"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}], "stream": True},
                 unused_handler,
@@ -143,6 +198,65 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.json()["error"]["type"], "workbuddy_acp_error")
         self.assertNotIn("choices", response.text)
+
+    async def test_acp_stream_forwards_incremental_deltas(self):
+        async def unused_handler(request):
+            raise AssertionError("HTTP transport should not be used")
+
+        async def events(messages, **kwargs):
+            yield NormalizedEvent("text_delta", text="one ")
+            yield NormalizedEvent("text_delta", text="two")
+            yield NormalizedEvent("completed")
+
+        with (
+            patch.object(
+                proxy_server,
+                "resolve_proxy_session",
+                return_value=(
+                    {"id": "proxy-test", "project": "/tmp/project"},
+                    "http://isolated-sidecar",
+                ),
+            ),
+            patch.object(proxy_server, "stream_workbuddy_chat", side_effect=events),
+        ):
+            response = await self.call_app(
+                {"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                unused_handler,
+                transport="workbuddy_acp",
+            )
+        data_lines = [line.removeprefix("data: ") for line in response.text.splitlines() if line.startswith("data: ")]
+        chunks = [json.loads(line) for line in data_lines if line != "[DONE]"]
+        deltas = [choice["delta"].get("content") for chunk in chunks for choice in chunk["choices"]]
+        self.assertEqual([delta for delta in deltas if delta], ["one ", "two"])
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertTrue(response.text.rstrip().endswith("data: [DONE]"))
+
+    async def test_acp_error_after_delta_is_sse_error_without_done(self):
+        async def unused_handler(request):
+            raise AssertionError("HTTP transport should not be used")
+
+        async def events(messages, **kwargs):
+            yield NormalizedEvent("text_delta", text="partial")
+            raise WorkBuddyAcpError("gateway lost", category="network", retryable=True)
+
+        with (
+            patch.object(
+                proxy_server,
+                "resolve_proxy_session",
+                return_value=(
+                    {"id": "proxy-test", "project": "/tmp/project"},
+                    "http://isolated-sidecar",
+                ),
+            ),
+            patch.object(proxy_server, "stream_workbuddy_chat", side_effect=events),
+        ):
+            response = await self.call_app(
+                {"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                unused_handler,
+                transport="workbuddy_acp",
+            )
+        self.assertIn("workbuddy_acp_network", response.text)
+        self.assertNotIn("[DONE]", response.text)
 
 
 if __name__ == "__main__":

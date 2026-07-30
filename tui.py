@@ -127,6 +127,50 @@ def list_models_and_status():
     
     Prompt.ask("\nPress [bold cyan]Enter[/bold cyan] to return to menu...")
 
+def choose_project() -> str:
+    default = os.path.abspath(config.PROXY_DEFAULT_PROJECT)
+    while True:
+        project = Prompt.ask("[bold cyan]Project directory[/bold cyan]", default=default).strip()
+        resolved = os.path.abspath(os.path.expanduser(project))
+        if os.path.isdir(resolved):
+            return resolved
+        console.print(f"[red]Directory does not exist: {resolved}[/red]")
+
+
+def choose_proxy_session(project: str) -> dict:
+    with httpx.Client(timeout=10.0) as client:
+        response = client.get(f"{PROXY_URL}/proxy/sessions", params={"project": project})
+        response.raise_for_status()
+        sessions = response.json().get("data", [])
+        if sessions:
+            table = Table(title="Proxy sessions for this project")
+            table.add_column("Choice", style="cyan")
+            table.add_column("Title")
+            table.add_column("Session ID", style="dim")
+            table.add_column("Last used")
+            table.add_row("0", "Create new session", "", "")
+            for index, session in enumerate(sessions, 1):
+                table.add_row(str(index), session["title"], session["id"], session["updated_at"])
+            console.print(table)
+            choices = [str(index) for index in range(len(sessions) + 1)]
+            selected = Prompt.ask("Select session", choices=choices, default="0")
+            if selected != "0":
+                return sessions[int(selected) - 1]
+        title = Prompt.ask("New session title", default=os.path.basename(project) or "Proxy session")
+        response = client.post(f"{PROXY_URL}/proxy/sessions", json={"project": project, "title": title})
+        response.raise_for_status()
+        return response.json()
+
+
+def save_history(session_id: str, messages: list[dict]):
+    with httpx.Client(timeout=10.0) as client:
+        response = client.post(
+            f"{PROXY_URL}/proxy/sessions/{session_id}/history",
+            json={"messages": messages},
+        )
+        response.raise_for_status()
+
+
 def interactive_chat():
     render_banner()
     if not check_proxy_online():
@@ -141,10 +185,24 @@ def interactive_chat():
     if not key:
         console.print("[bold yellow]⚠ Warning: No API Key configured. Requests will rely on proxy defaults.[/bold yellow]")
 
+    project = choose_project()
+    session = choose_proxy_session(project)
+    session_id = session["id"]
     model = "gpt-5.6-sol"
-    console.print(Panel(f"[bold green]Interactive Chat Session[/bold green]\nModel: [cyan]{model}[/cyan] | URL: [dim]{PROXY_URL}/v1/chat/completions[/dim]\nType [bold red]'exit'[/bold red] or [bold red]'quit'[/bold red] to return to menu.", border_style="green"))
+    console.print(
+        Panel(
+            f"[bold green]Interactive Proxy Session[/bold green]\n"
+            f"Project: [cyan]{project}[/cyan]\n"
+            f"Session: [cyan]{session['title']}[/cyan] [dim]({session_id})[/dim]\n"
+            f"Model: [cyan]{model}[/cyan] | URL: [dim]{PROXY_URL}/v1/chat/completions[/dim]\n"
+            "Type [bold red]'exit'[/bold red] or [bold red]'quit'[/bold red] to return to menu.",
+            border_style="green",
+        )
+    )
 
-    history = []
+    history = list(session.get("history") or [])
+    if history:
+        console.print(f"[dim]Restored {len(history)} saved messages.[/dim]")
     
     while True:
         try:
@@ -156,7 +214,11 @@ def interactive_chat():
                 
             history.append({"role": "user", "content": user_input})
             
-            headers = {"Content-Type": "application/json"}
+            headers = {
+                "Content-Type": "application/json",
+                "X-WorkBuddy-Session": session_id,
+                "X-WorkBuddy-Project": project,
+            }
             if key:
                 headers["Authorization"] = f"Bearer {key}"
                 
@@ -196,8 +258,13 @@ def interactive_chat():
                 console.print(f"\n[bold red]Request Error: {e}[/bold red]")
                 assistant_reply = f"[Request Error: {e}]"
                 
-            if assistant_reply:
-                history.append({"role": "assistant", "content": assistant_reply})
+            if assistant_reply and not assistant_reply.startswith("["):
+                assistant_message = {"role": "assistant", "content": assistant_reply}
+                history.append(assistant_message)
+                try:
+                    save_history(session_id, [history[-2], assistant_message])
+                except Exception as exc:
+                    console.print(f"[yellow]Could not persist session history: {exc}[/yellow]")
                 
         except KeyboardInterrupt:
             console.print("\n[yellow]Chat session interrupted.[/yellow]")

@@ -30,9 +30,13 @@ def load_config(config_file: Path, environment: dict[str, str] | None = None):
             os.environ.get("FREEMODEL_TRANSPORT")
             or module.load_saved_value(
                 "FREEMODEL_TRANSPORT",
-                "workbuddy_acp" if "work.freemodel.dev" in module.DEFAULT_BASE_URL else "http",
+                "workbuddy_acp"
+                if module.is_protected_workbuddy_url(module.DEFAULT_BASE_URL)
+                else "http",
             )
         ).strip().lower()
+        if module.is_protected_workbuddy_url(module.DEFAULT_BASE_URL) and module.TRANSPORT != "workbuddy_acp":
+            raise ValueError("https://work.freemodel.dev requires FREEMODEL_TRANSPORT=workbuddy_acp")
     return module
 
 
@@ -88,10 +92,43 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_file = Path(directory) / "config.json"
             config_file.write_text(
-                json.dumps({"FREEMODEL_TRANSPORT": "workbuddy_acp"}),
+                json.dumps(
+                    {
+                        "FREEMODEL_BASE_URL": "https://api.freemodel.dev/v1",
+                        "FREEMODEL_TRANSPORT": "workbuddy_acp",
+                    }
+                ),
                 encoding="utf-8",
             )
-            config = load_config(config_file, {"FREEMODEL_TRANSPORT": "http"})
+            config = load_config(
+                config_file,
+                {
+                    "FREEMODEL_BASE_URL": "https://api.freemodel.dev/v1",
+                    "FREEMODEL_TRANSPORT": "http",
+                },
+            )
+
+        self.assertEqual(config.TRANSPORT, "http")
+
+    def test_protected_endpoint_rejects_http_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "config.json"
+            with self.assertRaisesRegex(ValueError, "requires FREEMODEL_TRANSPORT=workbuddy_acp"):
+                load_config(
+                    config_file,
+                    {
+                        "FREEMODEL_BASE_URL": "https://work.freemodel.dev/v1",
+                        "FREEMODEL_TRANSPORT": "http",
+                    },
+                )
+
+    def test_similar_hostname_is_not_treated_as_protected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = Path(directory) / "config.json"
+            config = load_config(
+                config_file,
+                {"FREEMODEL_BASE_URL": "https://work.freemodel.dev.attacker.test/v1"},
+            )
 
         self.assertEqual(config.TRANSPORT, "http")
 

@@ -7,6 +7,7 @@ from unittest.mock import patch
 import httpx
 
 import proxy_server
+from upstream_transport import NormalizedEvent, WorkBuddyAcpError
 
 
 class ResponsesProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -247,6 +248,61 @@ class ResponsesProtocolTests(unittest.IsolatedAsyncioTestCase):
                 {"role": "user", "content": "Hello"},
             ],
         )
+
+    async def test_acp_responses_stream_forwards_incremental_deltas(self):
+        transport = httpx.ASGITransport(app=proxy_server.app)
+
+        async def events(messages, **kwargs):
+            yield NormalizedEvent("text_delta", text="one ")
+            yield NormalizedEvent("text_delta", text="two")
+            yield NormalizedEvent("completed")
+
+        async with self.original_async_client(transport=transport, base_url="http://testserver") as client:
+            with (
+                patch.object(proxy_server.config, "TRANSPORT", "workbuddy_acp"),
+                patch.object(
+                    proxy_server,
+                    "resolve_proxy_session",
+                    return_value=(
+                        {"id": "proxy-test", "project": "/tmp/project"},
+                        "http://isolated-sidecar",
+                    ),
+                ),
+                patch.object(proxy_server, "stream_workbuddy_chat", side_effect=events),
+            ):
+                response = await client.post(
+                    "/v1/responses",
+                    json={"model": "gpt-5.6-sol", "input": "hi", "stream": True},
+                )
+
+        events_out = self.parse_sse(response)
+        deltas = [data["delta"] for name, data in events_out if name == "response.output_text.delta"]
+        self.assertEqual(deltas, ["one ", "two"])
+        self.assertEqual(events_out[-1][0], "response.completed")
+        self.assertEqual(events_out[-1][1]["response"]["output"][0]["content"][0]["text"], "one two")
+
+    async def test_acp_nonstreaming_preserves_auth_status(self):
+        transport = httpx.ASGITransport(app=proxy_server.app)
+        error = WorkBuddyAcpError("denied", category="authentication", status_code=403)
+        async with self.original_async_client(transport=transport, base_url="http://testserver") as client:
+            with (
+                patch.object(proxy_server.config, "TRANSPORT", "workbuddy_acp"),
+                patch.object(
+                    proxy_server,
+                    "resolve_proxy_session",
+                    return_value=(
+                        {"id": "proxy-test", "project": "/tmp/project"},
+                        "http://isolated-sidecar",
+                    ),
+                ),
+                patch.object(proxy_server, "complete_workbuddy_chat", side_effect=error),
+            ):
+                response = await client.post(
+                    "/v1/responses",
+                    json={"model": "gpt-5.6-sol", "input": "hi"},
+                )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["type"], "workbuddy_acp_error")
 
     async def test_streaming_tool_call_becomes_function_call_item(self):
         upstream_sse = "".join(

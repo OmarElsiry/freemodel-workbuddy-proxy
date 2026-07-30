@@ -3,6 +3,7 @@
 import os
 import json
 from pathlib import Path
+from urllib.parse import urlparse
 
 CONFIG_FILE = Path(__file__).parent / "config.json"
 DEFAULT_PUBLIC_BASE_URL = "https://api.freemodel.dev/v1"
@@ -58,6 +59,17 @@ def save_key(key: str):
     with open(CONFIG_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
+def upstream_hostname(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"Invalid FREEMODEL_BASE_URL: {base_url}")
+    return parsed.hostname.lower()
+
+
+def is_protected_workbuddy_url(base_url: str) -> bool:
+    return upstream_hostname(base_url) == "work.freemodel.dev"
+
+
 DEFAULT_BASE_URL = (
     os.environ.get("FREEMODEL_BASE_URL")
     or load_saved_base_url()
@@ -69,11 +81,15 @@ TRANSPORT = str(
     os.environ.get("FREEMODEL_TRANSPORT")
     or load_saved_value(
         "FREEMODEL_TRANSPORT",
-        "workbuddy_acp" if "work.freemodel.dev" in DEFAULT_BASE_URL else "http",
+        "workbuddy_acp" if is_protected_workbuddy_url(DEFAULT_BASE_URL) else "http",
     )
 ).strip().lower()
 if TRANSPORT not in {"http", "workbuddy_acp"}:
     raise ValueError(f"Unsupported FREEMODEL_TRANSPORT: {TRANSPORT}")
+if is_protected_workbuddy_url(DEFAULT_BASE_URL) and TRANSPORT != "workbuddy_acp":
+    raise ValueError(
+        "https://work.freemodel.dev requires FREEMODEL_TRANSPORT=workbuddy_acp"
+    )
 
 WORKBUDDY_ACP_URL = str(
     os.environ.get("WORKBUDDY_ACP_URL")
@@ -95,6 +111,57 @@ WORKBUDDY_ACP_MAX_ATTEMPTS = int(
     os.environ.get("WORKBUDDY_ACP_MAX_ATTEMPTS")
     or load_saved_value("WORKBUDDY_ACP_MAX_ATTEMPTS", 4)
 )
+if WORKBUDDY_ACP_TIMEOUT <= 0:
+    raise ValueError("WORKBUDDY_ACP_TIMEOUT must be greater than zero")
+if WORKBUDDY_ACP_MAX_ATTEMPTS < 1:
+    raise ValueError("WORKBUDDY_ACP_MAX_ATTEMPTS must be at least one")
+
+PROJECT_ROOT = Path(__file__).parent
+DEFAULT_CODEBUDDY_CLI = Path(
+    "/home/potterparker/workbuddy-linux/workbuddy-app/resources/app.asar.unpacked/cli/bin/codebuddy"
+)
+WORKBUDDY_CLI_PATH = str(
+    Path(
+        os.environ.get("WORKBUDDY_CLI_PATH")
+        or load_saved_value("WORKBUDDY_CLI_PATH", str(DEFAULT_CODEBUDDY_CLI))
+    ).expanduser()
+)
+PROXY_SESSION_STORE = str(
+    Path(
+        os.environ.get("PROXY_SESSION_STORE")
+        or load_saved_value("PROXY_SESSION_STORE", str(PROJECT_ROOT / ".proxy-sessions.json"))
+    ).expanduser()
+)
+PROXY_RUNTIME_DIR = str(
+    Path(
+        os.environ.get("PROXY_RUNTIME_DIR")
+        or load_saved_value("PROXY_RUNTIME_DIR", str(PROJECT_ROOT / ".proxy-runtime"))
+    ).expanduser()
+)
+PROXY_DEFAULT_PROJECT = str(
+    Path(
+        os.environ.get("PROXY_DEFAULT_PROJECT")
+        or load_saved_value("PROXY_DEFAULT_PROJECT", WORKBUDDY_ACP_CWD)
+    ).expanduser()
+)
+PROXY_SIDECAR_STARTUP_TIMEOUT = float(
+    os.environ.get("PROXY_SIDECAR_STARTUP_TIMEOUT")
+    or load_saved_value("PROXY_SIDECAR_STARTUP_TIMEOUT", 30)
+)
+PROXY_SIDECAR_IDLE_TIMEOUT = float(
+    os.environ.get("PROXY_SIDECAR_IDLE_TIMEOUT")
+    or load_saved_value("PROXY_SIDECAR_IDLE_TIMEOUT", 900)
+)
+PROXY_MAX_HISTORY_TURNS = int(
+    os.environ.get("PROXY_MAX_HISTORY_TURNS")
+    or load_saved_value("PROXY_MAX_HISTORY_TURNS", 100)
+)
+if PROXY_SIDECAR_STARTUP_TIMEOUT <= 0:
+    raise ValueError("PROXY_SIDECAR_STARTUP_TIMEOUT must be greater than zero")
+if PROXY_SIDECAR_IDLE_TIMEOUT < 0:
+    raise ValueError("PROXY_SIDECAR_IDLE_TIMEOUT must not be negative")
+if PROXY_MAX_HISTORY_TURNS < 1:
+    raise ValueError("PROXY_MAX_HISTORY_TURNS must be at least one")
 
 CLIENT_HEADERS = {}
 
@@ -127,4 +194,8 @@ AVAILABLE_MODELS = [
 ]
 
 DEFAULT_PORT = int(os.environ.get("PROXY_PORT", "40589"))
-DEFAULT_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
+DEFAULT_HOST = os.environ.get("PROXY_HOST", "0.0.0.0").strip()
+if not 1 <= DEFAULT_PORT <= 65535:
+    raise ValueError("PROXY_PORT must be between 1 and 65535")
+if not DEFAULT_HOST:
+    raise ValueError("PROXY_HOST must not be empty")
