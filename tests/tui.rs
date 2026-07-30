@@ -7,7 +7,11 @@ use freemodel_workbuddy_proxy::{
     tui::{commands, composer::Composer, event, terminal::sanitize},
 };
 use predicates::prelude::PredicateBooleanExt;
-use std::{os::unix::fs::PermissionsExt, process::Command};
+use std::{
+    net::TcpListener,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+    process::Command,
+};
 
 #[test]
 fn launcher_rejects_invalid_arguments_before_build_work() {
@@ -43,6 +47,11 @@ fn launcher_always_delegates_freshness_to_cargo() {
         temp.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     let output = Command::new("timeout")
         .args(["1s", "bash"])
         .arg(root.join("start.sh"))
@@ -50,9 +59,14 @@ fn launcher_always_delegates_freshness_to_cargo() {
         .current_dir(root)
         .env("PATH", path)
         .env("CARGO_LOG", &log)
+        .env("PROXY_PORT", port.to_string())
         .output()
         .unwrap();
-    assert!(matches!(output.status.code(), Some(124 | 143)));
+    assert!(
+        matches!(output.status.code(), Some(124 | 143)) || output.status.signal() == Some(15),
+        "unexpected launcher timeout status: {:?}",
+        output.status
+    );
     assert_eq!(
         std::fs::read_to_string(log).unwrap(),
         format!(

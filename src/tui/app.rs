@@ -102,6 +102,7 @@ pub struct App {
     pub modal_input: Composer,
     pub modal_selected: usize,
     pub diagnostics: String,
+    pub base_url: String,
     next_request_id: u64,
     pub last_user: Option<String>,
 }
@@ -137,6 +138,7 @@ pub enum Action {
         request_id: u64,
         text: String,
         elapsed: Duration,
+        source_delta: bool,
     },
     StreamCompleted {
         request_id: u64,
@@ -204,6 +206,7 @@ impl App {
         project: String,
         session: SessionRecord,
         model: String,
+        base_url: String,
         sidebar: bool,
         no_color: bool,
     ) -> Self {
@@ -233,6 +236,7 @@ impl App {
             modal_input: Composer::default(),
             modal_selected: 0,
             diagnostics: String::new(),
+            base_url,
             next_request_id: 1,
             last_user: None,
         }
@@ -355,11 +359,14 @@ impl App {
                 request_id,
                 text,
                 elapsed,
+                source_delta,
             } if self.current_request_id() == Some(request_id) => {
                 if self.metrics.first_delta.is_none() {
                     self.metrics.first_delta = Some(elapsed);
                 }
-                self.metrics.deltas += 1;
+                if source_delta {
+                    self.metrics.deltas += 1;
+                }
                 self.metrics.bytes += text.len();
                 if let Some(m) = self
                     .messages
@@ -701,7 +708,14 @@ mod tests {
     }
     #[test]
     fn late_stream_events_are_ignored() {
-        let mut a = App::new("/tmp".into(), session(), "gpt".into(), true, false);
+        let mut a = App::new(
+            "/tmp".into(),
+            session(),
+            "gpt".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
         a.update(Action::StartRequest {
             request_id: 2,
             user: "x".into(),
@@ -710,12 +724,20 @@ mod tests {
             request_id: 1,
             text: "wrong".into(),
             elapsed: Duration::ZERO,
+            source_delta: true,
         });
         assert_eq!(a.messages.last().unwrap().content, "");
     }
     #[test]
     fn completion_saves_exact_turn() {
-        let mut a = App::new("/tmp".into(), session(), "gpt".into(), true, false);
+        let mut a = App::new(
+            "/tmp".into(),
+            session(),
+            "gpt".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
         a.update(Action::StartRequest {
             request_id: 1,
             user: "x".into(),
@@ -724,6 +746,7 @@ mod tests {
             request_id: 1,
             text: "y".into(),
             elapsed: Duration::ZERO,
+            source_delta: true,
         });
         assert!(matches!(
             a.update(Action::StreamCompleted {
@@ -736,7 +759,14 @@ mod tests {
     }
     #[test]
     fn destructive_commands_confirm() {
-        let mut a = App::new("/tmp".into(), session(), "gpt".into(), true, false);
+        let mut a = App::new(
+            "/tmp".into(),
+            session(),
+            "gpt".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
         a.composer.set("/delete");
         assert!(a.update(Action::Submit).is_empty());
         assert_eq!(a.modal, Some(Modal::Confirm(ConfirmAction::DeleteSession)));
@@ -745,7 +775,14 @@ mod tests {
     #[test]
     fn failed_and_cancelled_generations_do_not_persist() {
         for cancelled in [false, true] {
-            let mut a = App::new("/tmp".into(), session(), "gpt".into(), true, false);
+            let mut a = App::new(
+                "/tmp".into(),
+                session(),
+                "gpt".into(),
+                "http://127.0.0.1:40589/v1".into(),
+                true,
+                false,
+            );
             a.update(Action::StartRequest {
                 request_id: 1,
                 user: "x".into(),
@@ -775,7 +812,14 @@ mod tests {
     }
     #[test]
     fn failure_preserves_partial_output_and_retry_replaces_failed_turn() {
-        let mut a = App::new("/tmp".into(), session(), "gpt".into(), true, false);
+        let mut a = App::new(
+            "/tmp".into(),
+            session(),
+            "gpt".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
         a.update(Action::StartRequest {
             request_id: 1,
             user: "question".into(),
@@ -784,6 +828,7 @@ mod tests {
             request_id: 1,
             text: "partial answer".into(),
             elapsed: Duration::ZERO,
+            source_delta: true,
         });
         a.update(Action::StreamFailed {
             request_id: 1,
@@ -807,7 +852,14 @@ mod tests {
     }
     #[test]
     fn retry_replaces_the_previous_turn_in_transcript() {
-        let mut a = App::new("/tmp".into(), session(), "gpt".into(), true, false);
+        let mut a = App::new(
+            "/tmp".into(),
+            session(),
+            "gpt".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
         a.update(Action::StartRequest {
             request_id: 1,
             user: "question".into(),
@@ -816,6 +868,7 @@ mod tests {
             request_id: 1,
             text: "old".into(),
             elapsed: Duration::ZERO,
+            source_delta: true,
         });
         a.update(Action::StreamCompleted {
             request_id: 1,
@@ -828,7 +881,14 @@ mod tests {
     }
     #[test]
     fn modal_pickers_and_settings_apply_selected_values() {
-        let mut a = App::new("/tmp".into(), session(), "old".into(), true, false);
+        let mut a = App::new(
+            "/tmp".into(),
+            session(),
+            "old".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
         a.models = vec![ModelInfo {
             id: "new".into(),
             object: "model".into(),
@@ -847,7 +907,14 @@ mod tests {
     }
     #[test]
     fn direct_model_and_project_commands_have_real_effects() {
-        let mut a = App::new("/tmp".into(), session(), "old".into(), true, false);
+        let mut a = App::new(
+            "/tmp".into(),
+            session(),
+            "old".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
         a.composer.set("/model new");
         assert_eq!(
             a.update(Action::Submit),

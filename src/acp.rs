@@ -173,7 +173,7 @@ impl AcpTransport {
             self.rpc(&client,&connection,&token,2,"session/new",json!({"cwd":self.cwd,"mcpServers":[]}),|e|{if e.get("id").and_then(Value::as_i64)==Some(2){session_id=e.pointer("/result/sessionId").and_then(Value::as_str).unwrap_or("").into();}Ok(())}).await?;
             if session_id.is_empty(){return Err(AcpError::new("WorkBuddy ACP did not create a session","protocol"));}
             let prompt=serialize_messages(&messages);let mut complete=false;let mut disconnected=false;
-            self.rpc(&client,&connection,&token,3,"session/prompt",json!({"sessionId":session_id,"prompt":[{"type":"text","text":prompt}]}),|e|{if e.get("method").and_then(Value::as_str)==Some("session/update")&&e.pointer("/params/update/sessionUpdate").and_then(Value::as_str)==Some("agent_message_chunk"){if let Some(text)=e.pointer("/params/update/content/text").and_then(Value::as_str).filter(|s|!s.is_empty()){emitted.store(true,Ordering::Release);match tx.try_send(Ok(NormalizedEvent::TextDelta(text.into()))){Ok(())=>{},Err(mpsc::error::TrySendError::Closed(_))=>disconnected=true,Err(mpsc::error::TrySendError::Full(_))=>return Err(AcpError::new("WorkBuddy ACP downstream buffer is full","capacity")),}}}else if e.get("id").and_then(Value::as_i64)==Some(3){let reason=e.pointer("/result/stopReason").and_then(Value::as_str).unwrap_or("");if reason=="end_turn"{complete=true;}else{return Err(AcpError::new(format!("WorkBuddy ACP stopped with reason: {}",if reason.is_empty(){"unknown"}else{reason}),if reason=="refusal"{"refusal"}else{"upstream"}).retryable(reason=="refusal"));}}Ok(())}).await?;
+            self.rpc(&client,&connection,&token,3,"session/prompt",json!({"sessionId":session_id,"prompt":[{"type":"text","text":prompt}]}),|e|{if e.get("method").and_then(Value::as_str)==Some("session/update")&&e.pointer("/params/update/sessionUpdate").and_then(Value::as_str)==Some("agent_message_chunk"){if let Some(text)=e.pointer("/params/update/content/text").and_then(Value::as_str).filter(|s|!s.is_empty()){emitted.store(true,Ordering::Release);match tx.try_send(Ok(NormalizedEvent::TextDelta(text.into()))){Ok(())=>{},Err(mpsc::error::TrySendError::Closed(_))=>disconnected=true,Err(mpsc::error::TrySendError::Full(_))=>return Err(AcpError::new("WorkBuddy ACP downstream buffer is full","capacity")),}}}else if e.get("id").and_then(Value::as_i64)==Some(3){let reason=e.pointer("/result/stopReason").and_then(Value::as_str).unwrap_or("");if reason=="end_turn"{complete=true;}else{return Err(prompt_stop_error(e,reason));}}Ok(())}).await?;
             if disconnected { self.cancel(&client,&connection,&token,&session_id).await; return Ok(()); }
             if !complete{return Err(AcpError::new("WorkBuddy ACP prompt ended without completion","protocol"));}let _=tx.send(Ok(NormalizedEvent::Completed)).await;Ok(())}.await;
         if result.is_err() && !session_id.is_empty() && tx.is_closed() {
@@ -328,6 +328,73 @@ pub fn serialize_messages(messages: &[Value]) -> String {
     lines.push("ASSISTANT:".into());
     lines.join("\n")
 }
+fn prompt_stop_error(event: &Value, reason: &str) -> AcpError {
+    let fallback = format!(
+        "WorkBuddy ACP stopped with reason: {}",
+        if reason.is_empty() { "unknown" } else { reason }
+    );
+    let Some(raw) = event
+        .pointer("/result/_meta/codebuddy.ai~1errorMessage")
+        .and_then(Value::as_str)
+    else {
+        return AcpError::new(
+            fallback,
+            if reason == "refusal" {
+                "refusal"
+            } else {
+                "upstream"
+            },
+        )
+        .retryable(reason == "refusal");
+    };
+    let parsed = serde_json::from_str::<Value>(raw).ok();
+    let detail = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/data/details").and_then(Value::as_str))
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("message").and_then(Value::as_str))
+        })
+        .unwrap_or(raw)
+        .trim();
+    let status = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/data/statusCode").and_then(Value::as_u64))
+        .and_then(|value| u16::try_from(value).ok())
+        .and_then(|value| StatusCode::from_u16(value).ok());
+    let provider_category = parsed
+        .as_ref()
+        .and_then(|value| value.pointer("/data/category").and_then(Value::as_str))
+        .unwrap_or_default();
+    let category = match provider_category {
+        "quota" | "capacity" => "capacity",
+        "authentication" | "custom_model_auth" => "authentication",
+        _ if reason == "refusal" => "refusal",
+        _ => "upstream",
+    };
+    let mut error = AcpError::new(
+        if detail.is_empty() {
+            fallback
+        } else {
+            format!("WorkBuddy model request failed: {detail}")
+        },
+        category,
+    );
+    if let Some(status) = status {
+        error = error.status(status);
+    }
+    error.retryable(
+        matches!(status.map(|value| value.as_u16()), Some(408 | 409 | 425))
+            || status.is_some_and(|value| value.is_server_error()),
+    )
+}
+
+#[doc(hidden)]
+pub fn prompt_stop_error_for_test(event: &Value, reason: &str) -> AcpError {
+    prompt_stop_error(event, reason)
+}
+
 pub fn discover_all(root: Option<&Path>) -> Vec<String> {
     let root = root.map(PathBuf::from).unwrap_or_else(|| {
         std::env::var("CODEBUDDY_CONFIG_DIR")

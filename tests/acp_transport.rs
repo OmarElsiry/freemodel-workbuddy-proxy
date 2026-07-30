@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use freemodel_workbuddy_proxy::{
-    acp::{AcpTransport, discover_all, serialize_messages},
+    acp::{AcpTransport, discover_all, prompt_stop_error_for_test, serialize_messages},
     error::AcpError,
     models::NormalizedEvent,
 };
@@ -33,6 +33,30 @@ fn serializes_history_tools_and_omits_runtime_instructions() {
     assert!(text.contains("TOOL[c1]:\nresult"));
     assert!(text.ends_with("ASSISTANT:"));
 }
+#[test]
+fn surfaces_provider_quota_from_refusal_metadata() {
+    let provider = json!({
+        "code": -32003,
+        "message": "Quota exceeded",
+        "data": {
+            "details": "429 Credits exhausted. Purchase add-on packs.",
+            "statusCode": 429,
+            "category": "quota"
+        }
+    });
+    let event = json!({
+        "result": {
+            "stopReason": "refusal",
+            "_meta": {"codebuddy.ai/errorMessage": provider.to_string()}
+        }
+    });
+    let error = prompt_stop_error_for_test(&event, "refusal");
+    assert_eq!(error.category, "capacity");
+    assert_eq!(error.status_code, Some(StatusCode::TOO_MANY_REQUESTS));
+    assert!(!error.retryable);
+    assert!(error.message.contains("Credits exhausted"));
+}
+
 #[test]
 fn classifies_http_failures() {
     let cases = [

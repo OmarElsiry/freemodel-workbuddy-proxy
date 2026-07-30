@@ -187,6 +187,9 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         PersistenceState::Unsaved(_) => "unsaved",
     };
     let side = Text::from(vec![
+        Line::from("Proxy"),
+        Line::raw(app.base_url.clone()),
+        Line::raw(""),
         Line::from("Diagnostics"),
         Line::raw(format!("TTFB: {first}")),
         Line::raw(format!("Total: {total}")),
@@ -486,7 +489,14 @@ mod tests {
     use serde_json::json;
     fn app() -> App {
         let s:SessionRecord=serde_json::from_value(json!({"id":"proxy-12345678","title":"Test","project":"/tmp","automatic":false,"created_at":"x","updated_at":"x","history":[],"sidecar":{}})).unwrap();
-        App::new("/tmp".into(), s, "gpt-5.6-sol".into(), true, false)
+        App::new(
+            "/tmp".into(),
+            s,
+            "gpt-5.6-sol".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        )
     }
     #[test]
     fn renders_wide_narrow_and_small_without_panic() {

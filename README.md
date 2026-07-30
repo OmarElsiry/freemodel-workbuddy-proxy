@@ -82,7 +82,7 @@ Running `./start.sh` opens the Rust hybrid TUI:
 
 Press `F1` or type `/help` for all shortcuts and commands. Common actions include `Ctrl+O` session picker, `Ctrl+P` project switch, `Ctrl+M` model picker, `Ctrl+R` retry, `Ctrl+E` edit/resend, `Esc` cancel/close, and `Ctrl+Q` safe exit. Session commands include `/new`, `/sessions`, `/switch`, `/rename`, `/clear`, and `/delete`; destructive commands require confirmation.
 
-Sidecar processes are temporary. An idle sidecar is stopped after `PROXY_SIDECAR_IDLE_TIMEOUT`, while the session title, project, and history stay available. Selecting or addressing that session again starts a new sidecar automatically. The proxy writes session metadata and sidecar log files with owner-only permissions (`0600`), keeps runtime directories private (`0700`), and launches each sidecar with a minimized environment that excludes proxy credentials, provider API keys, gateway passwords, and dynamic-loader injection variables.
+Sidecar processes are temporary. The first request for a session can take up to the configured `PROXY_SIDECAR_STARTUP_TIMEOUT` (90 seconds by default) while the official CLI initializes; later requests reuse the healthy sidecar. An idle sidecar is stopped after `PROXY_SIDECAR_IDLE_TIMEOUT`, while the session title, project, and history stay available. Selecting or addressing that session again starts a new sidecar automatically. The proxy writes session metadata and sidecar log files with owner-only permissions (`0600`), keeps runtime directories private (`0700`), and launches each sidecar with a minimized environment that excludes proxy credentials, provider API keys, gateway passwords, and dynamic-loader injection variables.
 
 ### Codex and OpenAI-compatible clients
 
@@ -159,9 +159,26 @@ cargo run --release -- key set
 
 ## 🔌 Connecting Your Apps (Cursor, Codex, Continue, OpenCode)
 
-- **Base URL**: `http://localhost:40589/v1` (use `/v1`, not `/v1/chat/completions`)
-- **API Key**: `fe_oa_...` (or any dummy key `sk-dummy` if configured in `config.json`)
+- **Base URL on this machine**: `http://127.0.0.1:40589/v1` (use `/v1`, not `/v1/chat/completions`). The launcher prints this URL, and the TUI sidebar and `/diagnostics` command show it while running.
+- **API Key**: leave blank when `PROXY_API_KEY` is blank; otherwise use the exact configured `PROXY_API_KEY` as a Bearer token. The upstream `FREEMODEL_API_KEY` is private to the proxy and should not be copied into clients.
 - **Supported Models**: `gpt-5.6-sol`, `gpt-4o`, `opencode-default`
+
+Example Codex CLI configuration in `~/.codex/config.toml`:
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "freemodel_local"
+
+[model_providers.freemodel_local]
+name = "Freemodel local proxy"
+base_url = "http://127.0.0.1:40589/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+```
+
+Set `OPENAI_API_KEY` to the configured `PROXY_API_KEY`; when proxy authentication is disabled, any non-empty placeholder is sufficient for clients that require a credential variable. This provider configuration was smoke-tested with Codex CLI `0.146.0`. A `429 Credits exhausted` response comes from the logged-in WorkBuddy account, not from local proxy connectivity.
+
+The default `PROXY_HOST=127.0.0.1` is intentionally available only on the same computer. For another trusted device on your LAN, set both `PROXY_HOST=0.0.0.0` and a strong non-empty `PROXY_API_KEY`, allow TCP port `40589` only on the private firewall zone, and use `http://<this-computer-LAN-IP>:40589/v1`. Do not expose an unauthenticated wildcard bind to a LAN or the public internet.
 
 ---
 

@@ -19,11 +19,10 @@ use tokio_util::sync::CancellationToken;
 
 pub async fn run(config: &crate::config::Config) -> Result<()> {
     println!("Freemodel WorkBuddy Proxy · Rust TUI");
-    println!(
-        "Preflight: {} transport · {}",
-        config.transport,
-        setup::proxy_url(config)
-    );
+    let proxy_url = setup::proxy_url(config);
+    let base_url = format!("{proxy_url}/v1");
+    println!("Preflight: {} transport · {proxy_url}", config.transport);
+    println!("OpenAI-compatible base URL: {base_url}");
     let server = setup::ensure_server(config).await?;
     println!(
         "Proxy: online{}",
@@ -44,7 +43,7 @@ pub async fn run(config: &crate::config::Config) -> Result<()> {
     println!("API key: {}", mask_key(&config.api_key));
     let pref_path = preferences_path(&config.runtime_dir);
     let mut prefs = Preferences::load(&pref_path);
-    let client = ProxyClient::new(setup::proxy_url(config), config.api_key.clone())?;
+    let client = ProxyClient::new(&proxy_url, config.api_key.clone())?;
     let project = setup::choose_project(config, &prefs)?;
     let session = guided_session(
         &client,
@@ -58,6 +57,7 @@ pub async fn run(config: &crate::config::Config) -> Result<()> {
         project,
         session,
         prefs.model.clone(),
+        base_url,
         prefs.sidebar,
         prefs.no_color,
     );
@@ -195,10 +195,12 @@ fn stream_action(event: StreamEvent) -> Action {
             request_id,
             text,
             elapsed,
+            source_delta,
         } => Action::StreamDelta {
             request_id,
             text,
             elapsed,
+            source_delta,
         },
         StreamEvent::Completed {
             request_id, total, ..
@@ -306,9 +308,10 @@ async fn execute_effect(
         Effect::LoadDiagnostics => match client.diagnostics().await {
             Ok(value) => {
                 app.update(Action::DiagnosticsLoaded(format!(
-                    "Version: {}\nUptime: {}s\nBind: {}\nTransport: {}\nUpstream: {}\nSession store: {}\nRuntime: {}\nSidecars: {}/{}\nRSS: {}",
+                    "Version: {}\nUptime: {}s\nBase URL: {}/v1\nBind: {}\nTransport: {}\nUpstream: {}\nSession store: {}\nRuntime: {}\nSidecars: {}/{}\nRSS: {}",
                     value.version,
                     value.uptime_seconds,
+                    value.bind_url,
                     value.bind_url,
                     value.transport,
                     value.upstream_host,

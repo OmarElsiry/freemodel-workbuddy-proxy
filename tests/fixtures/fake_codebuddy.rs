@@ -33,18 +33,31 @@ fn main() {
         .find(|pair| pair[0] == "--port")
         .and_then(|pair| pair[1].parse::<u16>().ok())
         .expect("--port is required");
+    if std::env::var_os("WORKBUDDY_PROXY_TEST_EXIT").is_some() {
+        eprintln!("intentional fake sidecar startup failure");
+        std::process::exit(17);
+    }
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind fake sidecar");
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         let mut request = [0_u8; 2048];
         let size = stream.read(&mut request).unwrap_or_default();
         let request = String::from_utf8_lossy(&request[..size]);
-        let status = if request.starts_with("GET /api/v1/health ") {
+        let required_header = request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("x-codebuddy-request: 1"));
+        let status = if request.starts_with("GET /api/v1/health ") && required_header {
             "200 OK"
+        } else if request.starts_with("GET /api/v1/health ") {
+            "403 Forbidden"
         } else {
             "404 Not Found"
         };
-        let body = if status == "200 OK" { "ok" } else { "missing" };
+        let body = match status {
+            "200 OK" => "ok",
+            "403 Forbidden" => "missing x-codebuddy-request",
+            _ => "missing",
+        };
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()

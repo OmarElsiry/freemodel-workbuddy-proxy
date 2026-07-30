@@ -1,6 +1,6 @@
 use freemodel_workbuddy_proxy::{
     session_store::SessionStore,
-    sidecar::{SidecarManager, process_matches},
+    sidecar::{SidecarManager, process_matches, sanitize_log_tail},
 };
 use serial_test::serial;
 use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
@@ -22,6 +22,12 @@ fn current_test_process_is_not_mistaken_for_sidecar() {
 #[test]
 fn nonexistent_process_is_not_owned() {
     assert!(!process_matches(99_999_999, "proxy-test-marker"));
+}
+
+#[test]
+fn sidecar_log_tail_removes_terminal_control_sequences() {
+    let raw = "\u{1b}[38;5;79mCodeBuddy\u{1b}[39m \u{1b}]8;;http://127.0.0.1:44945/\u{7}link\u{1b}]8;;\u{7}\nready";
+    assert_eq!(sanitize_log_tail(raw), "CodeBuddy link\nready");
 }
 
 #[tokio::test]
@@ -60,6 +66,43 @@ async fn missing_cli_fails_without_sidecar_metadata_or_runtime_artifacts() {
             .is_empty()
     );
     assert!(!runtime.exists());
+}
+
+#[tokio::test]
+async fn early_sidecar_exit_reports_log_and_leaves_no_metadata() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let runtime = root.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::write(runtime.join(".test-sidecar-exit"), b"1").unwrap();
+    let store = SessionStore::new(root.path().join("sessions.json"), 10);
+    let session = store
+        .create(
+            project.to_str().unwrap(),
+            "Exit",
+            Some("proxy-sidecar-exit"),
+            false,
+        )
+        .await
+        .unwrap();
+    let manager = SidecarManager::new(store.clone(), fake_codebuddy(), &runtime, 2.0, 0.0, 1);
+    let error = manager.ensure(&session).await.unwrap_err().to_string();
+    assert!(error.contains("exited with status"), "{error}");
+    assert!(error.contains("Sidecar log:"), "{error}");
+    assert!(
+        error.contains("intentional fake sidecar startup failure"),
+        "{error}"
+    );
+    assert!(
+        store
+            .get(&session.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .sidecar
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -196,6 +239,11 @@ async fn sidecar_environment_is_minimized() {
         "NODE_OPTIONS",
         "PYTHONPATH",
         "BASH_ENV",
+        "CLIENT_INFO_IDE_TYPE",
+        "CLIENT_INFO_PLUGIN_NAME",
+        "CLIENT_INFO_PRODUCT_NAME",
+        "CLIENT_INFO_PRODUCT_VERSION",
+        "CLIENT_INFO_USER_AGENT_EXTENSION",
     ]
     .map(|name| (name, std::env::var_os(name)));
     unsafe {
@@ -209,6 +257,11 @@ async fn sidecar_environment_is_minimized() {
         std::env::set_var("NODE_OPTIONS", "--inspect=127.0.0.1:9");
         std::env::set_var("PYTHONPATH", "/tmp/untrusted-python");
         std::env::set_var("BASH_ENV", "/tmp/untrusted-shell");
+        std::env::set_var("CLIENT_INFO_IDE_TYPE", "WorkBuddy");
+        std::env::set_var("CLIENT_INFO_PLUGIN_NAME", "workbuddy-desktop");
+        std::env::set_var("CLIENT_INFO_PRODUCT_NAME", "WorkBuddy");
+        std::env::set_var("CLIENT_INFO_PRODUCT_VERSION", "test-version");
+        std::env::set_var("CLIENT_INFO_USER_AGENT_EXTENSION", "CLI/test");
     }
 
     let manager = SidecarManager::new(store, fake_codebuddy(), &runtime, 3.0, 0.0, 1);
@@ -246,6 +299,34 @@ async fn sidecar_environment_is_minimized() {
         Some("none")
     );
     assert!(environment.contains_key("PATH"));
+    assert_eq!(
+        environment.get("CLIENT_INFO_IDE_TYPE").map(String::as_str),
+        Some("WorkBuddy")
+    );
+    assert_eq!(
+        environment
+            .get("CLIENT_INFO_PLUGIN_NAME")
+            .map(String::as_str),
+        Some("workbuddy-desktop")
+    );
+    assert_eq!(
+        environment
+            .get("CLIENT_INFO_PRODUCT_NAME")
+            .map(String::as_str),
+        Some("WorkBuddy")
+    );
+    assert_eq!(
+        environment
+            .get("CLIENT_INFO_PRODUCT_VERSION")
+            .map(String::as_str),
+        Some("test-version")
+    );
+    assert_eq!(
+        environment
+            .get("CLIENT_INFO_USER_AGENT_EXTENSION")
+            .map(String::as_str),
+        Some("CLI/test")
+    );
     for name in [
         "PROXY_API_KEY",
         "FREEMODEL_API_KEY",

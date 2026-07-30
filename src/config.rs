@@ -104,7 +104,7 @@ impl Config {
             &home,
         );
         let startup = parse_f64(
-            get("PROXY_SIDECAR_STARTUP_TIMEOUT", Value::from(30.0)),
+            get("PROXY_SIDECAR_STARTUP_TIMEOUT", Value::from(90.0)),
             "PROXY_SIDECAR_STARTUP_TIMEOUT",
         )?;
         let idle = parse_f64(

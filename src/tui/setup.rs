@@ -19,10 +19,10 @@ impl ServerHandle {
     }
 }
 pub fn proxy_url(config: &Config) -> String {
-    let host = if config.host == "0.0.0.0" {
-        "127.0.0.1"
-    } else {
-        &config.host
+    let host = match config.host.as_str() {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        value => value,
     };
     format!("http://{host}:{}", config.port)
 }
@@ -140,4 +140,26 @@ pub fn read_secret(label: &str) -> Result<String> {
     io::stdout().flush()?;
     let secret = rpassword::read_password()?;
     Ok(secret.trim().into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proxy_url;
+    use crate::config::Config;
+    use std::{collections::HashMap, path::Path};
+
+    fn config(host: &str) -> Config {
+        let mut environment = HashMap::new();
+        environment.insert("HOME".into(), "/tmp".into());
+        environment.insert("PROXY_HOST".into(), host.into());
+        environment.insert("PROXY_PORT".into(), "40589".into());
+        Config::load_with_env(Path::new("/tmp"), &environment).unwrap()
+    }
+
+    #[test]
+    fn display_url_uses_reachable_loopback_for_wildcard_binds() {
+        assert_eq!(proxy_url(&config("0.0.0.0")), "http://127.0.0.1:40589");
+        assert_eq!(proxy_url(&config("::")), "http://[::1]:40589");
+        assert_eq!(proxy_url(&config("127.0.0.1")), "http://127.0.0.1:40589");
+    }
 }

@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use unicode_segmentation::UnicodeSegmentation;
+
+const TUI_TYPING_INTERVAL: Duration = Duration::from_millis(12);
 
 #[derive(Clone)]
 pub struct ProxyClient {
@@ -52,6 +55,7 @@ pub enum StreamEvent {
         request_id: u64,
         text: String,
         elapsed: Duration,
+        source_delta: bool,
     },
     Completed {
         request_id: u64,
@@ -273,14 +277,23 @@ impl ProxyClient {
     ) {
         let this = self.clone();
         tokio::spawn(async move {
-            if let Err(message) = this.run_stream(&request, &cancel, &tx).await {
-                let _ = tx
+            let (source_tx, source_rx) = mpsc::channel(64);
+            let presenter = tokio::spawn(present_stream(
+                source_rx,
+                tx.clone(),
+                cancel.clone(),
+                TUI_TYPING_INTERVAL,
+            ));
+            if let Err(message) = this.run_stream(&request, &cancel, &source_tx).await {
+                let _ = source_tx
                     .send(StreamEvent::Failed {
                         request_id: request.request_id,
                         message,
                     })
                     .await;
             }
+            drop(source_tx);
+            let _ = presenter.await;
         });
     }
     async fn run_stream(
@@ -390,6 +403,7 @@ async fn consume_line(
                     request_id: id,
                     text: text.into(),
                     elapsed: start.elapsed(),
+                    source_delta: true,
                 })
                 .await
                 .map_err(|_| "TUI event loop closed".to_string())?;
@@ -400,6 +414,56 @@ async fn consume_line(
         None => Ok(false),
     }
 }
+async fn present_stream(
+    mut source: mpsc::Receiver<StreamEvent>,
+    output: mpsc::Sender<StreamEvent>,
+    cancel: CancellationToken,
+    interval: Duration,
+) {
+    while let Some(event) = source.recv().await {
+        match event {
+            StreamEvent::Delta {
+                request_id,
+                text,
+                elapsed,
+                ..
+            } => {
+                let graphemes = UnicodeSegmentation::graphemes(text.as_str(), true)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                for (index, grapheme) in graphemes.iter().enumerate() {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    if output
+                        .send(StreamEvent::Delta {
+                            request_id,
+                            text: grapheme.clone(),
+                            elapsed,
+                            source_delta: index == 0,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if index + 1 < graphemes.len() && !interval.is_zero() {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep(interval) => {}
+                        }
+                    }
+                }
+            }
+            terminal => {
+                if output.send(terminal).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn clean(error: reqwest::Error) -> String {
     if error.is_timeout() {
         "Request timed out".into()
@@ -439,7 +503,10 @@ fn extract_error(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Health, validate_health};
+    use super::{Health, StreamEvent, present_stream, validate_health};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     fn health(build_id: &str) -> Health {
         Health {
@@ -469,5 +536,59 @@ mod tests {
         let error = validate_health(&health("older-build")).unwrap_err();
         assert!(error.contains("different Freemodel proxy build"));
         assert!(error.contains("older-build"));
+    }
+
+    #[tokio::test]
+    async fn presenter_streams_unicode_graphemes_before_completion() {
+        let (source_tx, source_rx) = mpsc::channel(8);
+        let (output_tx, mut output_rx) = mpsc::channel(16);
+        let presenter = tokio::spawn(present_stream(
+            source_rx,
+            output_tx,
+            CancellationToken::new(),
+            Duration::ZERO,
+        ));
+        source_tx
+            .send(StreamEvent::Delta {
+                request_id: 7,
+                text: "A🇹🇷e\u{301}🙂".into(),
+                elapsed: Duration::from_millis(3),
+                source_delta: true,
+            })
+            .await
+            .unwrap();
+        source_tx
+            .send(StreamEvent::Completed {
+                request_id: 7,
+                total: Duration::from_millis(10),
+                deltas: 1,
+                bytes: 14,
+            })
+            .await
+            .unwrap();
+        drop(source_tx);
+
+        let mut text = String::new();
+        let mut source_deltas = 0;
+        let mut completed = false;
+        while let Some(event) = output_rx.recv().await {
+            match event {
+                StreamEvent::Delta {
+                    text: fragment,
+                    source_delta,
+                    ..
+                } => {
+                    text.push_str(&fragment);
+                    source_deltas += usize::from(source_delta);
+                    assert!(!completed);
+                }
+                StreamEvent::Completed { .. } => completed = true,
+                _ => panic!("unexpected presentation event"),
+            }
+        }
+        presenter.await.unwrap();
+        assert_eq!(text, "A🇹🇷e\u{301}🙂");
+        assert_eq!(source_deltas, 1);
+        assert!(completed);
     }
 }
