@@ -54,10 +54,10 @@ impl Config {
         let config_file = project_root.join("config.json");
         let saved = read_object(&config_file);
         let get = |name: &str, fallback: Value| -> Value {
-            environment
+            saved
                 .get(name)
-                .map(|v| Value::String(v.clone()))
-                .or_else(|| saved.get(name).cloned())
+                .cloned()
+                .or_else(|| environment.get(name).map(|v| Value::String(v.clone())))
                 .unwrap_or(fallback)
         };
         let text = |name: &str, fallback: &str| -> String {

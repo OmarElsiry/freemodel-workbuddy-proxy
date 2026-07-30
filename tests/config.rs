@@ -12,7 +12,7 @@ fn defaults_to_public_http_and_loopback() {
     assert_eq!(config.host, "127.0.0.1");
 }
 #[test]
-fn environment_precedes_saved_config() {
+fn saved_project_config_precedes_inherited_environment() {
     let dir = tempdir().unwrap();
     std::fs::write(
         dir.path().join("config.json"),
@@ -28,9 +28,33 @@ fn environment_precedes_saved_config() {
     ]);
     assert_eq!(
         Config::load_with_env(dir.path(), &env).unwrap().base_url,
-        "https://env.example/v1"
+        "https://saved.example/v1"
     );
 }
+
+#[test]
+fn inherited_workbuddy_environment_cannot_override_explicit_public_project_config() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"FREEMODEL_API_KEY":"saved-public-key","FREEMODEL_BASE_URL":"https://api.freemodel.dev/v1","FREEMODEL_TRANSPORT":"http"}"#,
+    )
+    .unwrap();
+    let env = HashMap::from([
+        ("HOME".into(), dir.path().to_string_lossy().to_string()),
+        ("FREEMODEL_API_KEY".into(), "inherited-workbuddy-key".into()),
+        (
+            "FREEMODEL_BASE_URL".into(),
+            "https://work.freemodel.dev/v1".into(),
+        ),
+        ("FREEMODEL_TRANSPORT".into(), "workbuddy_acp".into()),
+    ]);
+    let config = Config::load_with_env(dir.path(), &env).unwrap();
+    assert_eq!(config.api_key, "saved-public-key");
+    assert_eq!(config.base_url, "https://api.freemodel.dev/v1");
+    assert_eq!(config.transport, "http");
+}
+
 #[test]
 fn protected_host_requires_acp_but_lookalike_does_not() {
     assert!(is_protected_workbuddy_url("https://work.freemodel.dev/v1").unwrap());
