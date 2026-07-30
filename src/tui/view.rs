@@ -496,4 +496,30 @@ mod tests {
             terminal.draw(|f| render(f, &app())).unwrap();
         }
     }
+    #[test]
+    fn renders_failed_assistant_reason_in_transcript() {
+        let mut app = app();
+        app.messages.push(super::super::app::ChatMessage {
+            role: "assistant".into(),
+            content: "Request failed: Could not connect to the local proxy".into(),
+            status: MessageStatus::Failed,
+        });
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Assistant  [failed]"), "{rendered}");
+        assert!(
+            rendered.contains("Request failed: Could not connect to the local proxy"),
+            "{rendered}"
+        );
+    }
 }

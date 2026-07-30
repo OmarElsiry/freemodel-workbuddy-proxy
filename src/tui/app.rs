@@ -388,11 +388,21 @@ impl App {
                 request_id,
                 message,
             } if self.current_request_id() == Some(request_id) => {
-                self.generation = GenerationState::Failed(message.clone());
+                let message = message.trim();
+                let detail = if message.is_empty() {
+                    "Request failed".to_string()
+                } else {
+                    format!("Request failed: {message}")
+                };
+                self.generation = GenerationState::Failed(message.to_string());
                 if let Some(m) = self.messages.last_mut() {
+                    if !m.content.is_empty() {
+                        m.content.push_str("\n\n");
+                    }
+                    m.content.push_str(&detail);
                     m.status = MessageStatus::Failed;
                 }
-                self.notify(format!("Request failed: {message}"));
+                self.notify(detail);
             }
             Action::StreamCancelled { request_id }
                 if self.current_request_id() == Some(request_id) =>
@@ -750,7 +760,50 @@ mod tests {
             };
             assert!(effects.is_empty());
             assert_ne!(a.messages.last().unwrap().status, MessageStatus::Complete);
+            assert_eq!(
+                a.history_values(),
+                vec![json!({"role":"user","content":"x"})]
+            );
+            if !cancelled {
+                assert_eq!(a.messages.last().unwrap().content, "Request failed: broken");
+                assert_eq!(
+                    a.notifications.back().map(String::as_str),
+                    Some("Request failed: broken")
+                );
+            }
         }
+    }
+    #[test]
+    fn failure_preserves_partial_output_and_retry_replaces_failed_turn() {
+        let mut a = App::new("/tmp".into(), session(), "gpt".into(), true, false);
+        a.update(Action::StartRequest {
+            request_id: 1,
+            user: "question".into(),
+        });
+        a.update(Action::StreamDelta {
+            request_id: 1,
+            text: "partial answer".into(),
+            elapsed: Duration::ZERO,
+        });
+        a.update(Action::StreamFailed {
+            request_id: 1,
+            message: "upstream disconnected".into(),
+        });
+        assert_eq!(
+            a.messages.last().unwrap().content,
+            "partial answer\n\nRequest failed: upstream disconnected"
+        );
+        assert_eq!(
+            a.history_values(),
+            vec![json!({"role":"user","content":"question"})]
+        );
+
+        let effects = a.update(Action::Retry);
+        assert!(matches!(effects.as_slice(), [Effect::Send { .. }]));
+        assert_eq!(a.messages.len(), 2);
+        assert_eq!(a.messages[0].content, "question");
+        assert_eq!(a.messages[1].status, MessageStatus::Streaming);
+        assert!(a.messages[1].content.is_empty());
     }
     #[test]
     fn retry_replaces_the_previous_turn_in_transcript() {
