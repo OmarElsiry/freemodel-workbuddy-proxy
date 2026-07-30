@@ -11,9 +11,11 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -101,45 +103,19 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 fn render_chat(frame: &mut Frame, app: &App, area: Rect) {
-    let (c, dim, warn) = colors(app);
-    let query = app.search.as_deref().unwrap_or("").to_lowercase();
-    let items = app.messages.iter().map(|m| {
-        let label = match m.role.as_str() {
-            "user" => "You",
-            "assistant" => "Assistant",
-            other => other,
-        };
-        let marker = match m.status {
-            MessageStatus::Complete => "",
-            MessageStatus::Streaming => "  [streaming]",
-            MessageStatus::Cancelled => "  [cancelled]",
-            MessageStatus::Failed => "  [failed]",
-        };
-        let role_color = if m.role == "user" {
-            c
-        } else if m.status == MessageStatus::Failed {
-            warn
-        } else {
-            Color::White
-        };
-        let content = sanitize(&m.content);
-        let highlighted = !query.is_empty() && content.to_lowercase().contains(&query);
-        ListItem::new(Text::from(vec![
-            Line::from(vec![Span::styled(
-                format!("{label}{marker}"),
-                Style::default().fg(role_color).add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(Span::styled(
-                if content.is_empty() && m.status == MessageStatus::Streaming {
-                    "▌".into()
-                } else {
-                    content
-                },
-                Style::default().fg(if highlighted { warn } else { Color::Reset }),
-            )),
-            Line::raw(""),
-        ]))
-    });
+    let (_, dim, _) = colors(app);
+    let content_width = usize::from(area.width.saturating_sub(2).max(1));
+    let lines = transcript_lines(app, content_width);
+    let viewport_height = area.height.saturating_sub(2);
+    let max_scroll = lines
+        .len()
+        .saturating_sub(usize::from(viewport_height))
+        .min(usize::from(u16::MAX)) as u16;
+    let scroll_from_top = if app.auto_scroll {
+        max_scroll
+    } else {
+        max_scroll.saturating_sub(app.scroll.min(max_scroll))
+    };
     let title = format!(
         " Conversation · {} messages{} ",
         app.messages.len(),
@@ -148,27 +124,95 @@ fn render_chat(frame: &mut Frame, app: &App, area: Rect) {
             .map(|q| format!(" · search: {q}"))
             .unwrap_or_default()
     );
-    let list = List::new(items)
+    let transcript = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(dim)),
         )
-        .scroll_padding(1);
-    let mut state = ratatui::widgets::ListState::default();
-    if !app.messages.is_empty() {
-        let selected = if app.auto_scroll {
-            app.messages.len().saturating_sub(1)
-        } else {
-            app.messages
-                .len()
-                .saturating_sub(1 + usize::from(app.scroll))
-        };
-        state.select(Some(selected));
-    }
-    frame.render_stateful_widget(list, area, &mut state);
+        .scroll((scroll_from_top, 0));
+    frame.render_widget(transcript, area);
 }
+
+fn transcript_lines<'a>(app: &'a App, width: usize) -> Vec<Line<'a>> {
+    let (c, _, warn) = colors(app);
+    let query = app.search.as_deref().unwrap_or("").to_lowercase();
+    let mut lines = Vec::new();
+    for message in &app.messages {
+        let label = match message.role.as_str() {
+            "user" => "You",
+            "assistant" => "Assistant",
+            other => other,
+        };
+        let marker = match message.status {
+            MessageStatus::Complete => "",
+            MessageStatus::Streaming => "  [streaming]",
+            MessageStatus::Cancelled => "  [cancelled]",
+            MessageStatus::Failed => "  [failed]",
+        };
+        let role_color = if message.role == "user" {
+            c
+        } else if message.status == MessageStatus::Failed {
+            warn
+        } else {
+            Color::White
+        };
+        let content = sanitize(&message.content);
+        let highlighted = !query.is_empty() && content.to_lowercase().contains(&query);
+        let content = if content.is_empty() && message.status == MessageStatus::Streaming {
+            "▌".into()
+        } else {
+            content
+        };
+        let content_style = Style::default().fg(if highlighted { warn } else { Color::Reset });
+        lines.push(Line::from(Span::styled(
+            format!("{label}{marker}"),
+            Style::default().fg(role_color).add_modifier(Modifier::BOLD),
+        )));
+        lines.extend(
+            wrap_text(&content, width)
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, content_style))),
+        );
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut result = Vec::new();
+    for logical in value.split('\n') {
+        if logical.is_empty() {
+            result.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        let mut line_width: usize = 0;
+        for grapheme in UnicodeSegmentation::graphemes(logical, true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
+            if line_width > 0 && line_width.saturating_add(grapheme_width) > width {
+                result.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+            line.push_str(grapheme);
+            line_width = line_width.saturating_add(grapheme_width);
+            if line_width >= width {
+                result.push(std::mem::take(&mut line));
+                line_width = 0;
+            }
+        }
+        if !line.is_empty() {
+            result.push(line);
+        }
+    }
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
+}
+
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let (_, dim, _) = colors(app);
     let first = app
@@ -507,6 +551,65 @@ mod tests {
         }
     }
     #[test]
+    fn wraps_long_unicode_transcript_content_into_visible_rows() {
+        assert_eq!(wrap_text("ab界🙂cd", 4), vec!["ab界", "🙂cd"]);
+        assert_eq!(
+            wrap_text("first\n\nsecond", 20),
+            vec!["first", "", "second"]
+        );
+
+        let mut app = app();
+        app.messages.push(super::super::app::ChatMessage {
+            role: "assistant".into(),
+            content: "FIRST_MARKER ".repeat(12)
+                + "\nEXPLICIT_NEWLINE\n"
+                + &"界🙂".repeat(50)
+                + " VISIBLE_TAIL",
+            status: MessageStatus::Complete,
+        });
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Assistant"), "{rendered}");
+        assert!(rendered.contains("EXPLICIT_NEWLINE"), "{rendered}");
+        assert!(rendered.contains("VISIBLE_TAIL"), "{rendered}");
+        let marker_rows = rendered
+            .lines()
+            .filter(|line| line.contains("FIRST_MARKER"))
+            .count();
+        assert!(marker_rows >= 2, "content was not wrapped:\n{rendered}");
+    }
+
+    #[test]
+    fn follows_tail_of_message_taller_than_transcript_viewport() {
+        let mut app = app();
+        app.messages.push(super::super::app::ChatMessage {
+            role: "assistant".into(),
+            content: (0..80)
+                .map(|index| format!("ROW_{index:02}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\nOVERSIZED_VISIBLE_TAIL",
+            status: MessageStatus::Streaming,
+        });
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("OVERSIZED_VISIBLE_TAIL"), "{rendered}");
+        assert!(!rendered.contains("ROW_00"), "{rendered}");
+
+        app.auto_scroll = false;
+        app.scroll = u16::MAX;
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Assistant  [streaming]"), "{rendered}");
+        assert!(rendered.contains("ROW_00"), "{rendered}");
+        assert!(!rendered.contains("OVERSIZED_VISIBLE_TAIL"), "{rendered}");
+    }
+
+    #[test]
     fn renders_failed_assistant_reason_in_transcript() {
         let mut app = app();
         app.messages.push(super::super::app::ChatMessage {
@@ -517,19 +620,23 @@ mod tests {
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = rendered_text(&terminal);
+        assert!(rendered.contains("Assistant  [failed]"), "{rendered}");
+        assert!(
+            rendered.contains("Request failed: Could not connect to the local proxy"),
+            "{rendered}"
+        );
+    }
+
+    fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
-        let rendered = (0..buffer.area.height)
+        (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
-            .join("\n");
-        assert!(rendered.contains("Assistant  [failed]"), "{rendered}");
-        assert!(
-            rendered.contains("Request failed: Could not connect to the local proxy"),
-            "{rendered}"
-        );
+            .join("\n")
     }
 }

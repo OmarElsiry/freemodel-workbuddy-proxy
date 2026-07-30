@@ -72,13 +72,14 @@ The proxy session ID is independent from WorkBuddy GUI conversation IDs. Session
 
 Running `./start.sh` opens the Rust hybrid TUI:
 
-1. verifies or starts the compatible local Rust proxy and reports actionable startup failures;
-2. asks for a project directory with recent-project choices;
-3. lists only proxy-owned sessions for that project and rejects invalid selections;
-4. lets you create a new session or reopen an old one;
-5. restores saved history and routes through the selected session's dedicated sidecar;
-6. opens a full-screen, resize-safe chat workspace with multiline input, validated streaming, cancellation, retry/edit-resend, transcript search, model and project selection, diagnostics, a bounded sanitized proxy-log view, and persisted non-secret preferences;
-7. uses full-transcript replacement after retry/edit so corrected turns replace saved history rather than duplicating old turns.
+1. securely prompts without echo for a Freemodel API key only when no usable key can be resolved from project configuration, inherited environment fallback, or Codex auth; the key is saved in the ignored project `config.json` with owner-only (`0600`) permissions and used immediately;
+2. verifies or starts the compatible local Rust proxy and reports actionable startup failures;
+3. asks for a project directory with recent-project choices;
+4. lists only proxy-owned sessions for that project and rejects invalid selections;
+5. lets you create a new session or reopen an old one;
+6. restores saved history and routes through the selected session's dedicated sidecar;
+7. opens a full-screen, resize-safe chat workspace with wrapped multiline transcripts, multiline input, validated streaming, cancellation, retry/edit-resend, transcript search, model and project selection, diagnostics, a bounded sanitized proxy-log view, and persisted non-secret preferences;
+8. uses full-transcript replacement after retry/edit so corrected turns replace saved history rather than duplicating old turns.
 
 Press `F1` or type `/help` for all shortcuts and commands. Common actions include `Ctrl+O` session picker, `Ctrl+P` project switch, `Ctrl+M` model picker, `Ctrl+R` retry, `Ctrl+E` edit/resend, `Esc` cancel/close, and `Ctrl+Q` safe exit. Session commands include `/new`, `/sessions`, `/switch`, `/rename`, `/clear`, and `/delete`; destructive commands require confirmation.
 
@@ -134,6 +135,8 @@ Deleting a session stops only a process whose PID and command line match the pro
 ```bash
 ./start.sh
 ```
+
+On the first interactive launch, if no usable API key is already available, the TUI asks for it securely without displaying the entered characters and stores it only in the ignored local `config.json` with `0600` permissions. Later launches reuse the saved key and do not prompt again.
 
 Or build and run it directly:
 
