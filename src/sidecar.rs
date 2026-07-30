@@ -72,11 +72,12 @@ impl SidecarManager {
         let pid = current.sidecar.get("pid").and_then(Value::as_i64);
         let url = current.sidecar.get("url").and_then(Value::as_str);
         let marker = format!("proxy_{}", session.id);
-        if let (Some(pid), Some(url)) = (pid, url) {
-            if process_matches(pid, &marker) && healthy(url).await {
-                self.last.lock().insert(session.id.clone(), Instant::now());
-                return Ok(url.into());
-            }
+        if let (Some(pid), Some(url)) = (pid, url)
+            && process_matches(pid, &marker)
+            && healthy(url).await
+        {
+            self.last.lock().insert(session.id.clone(), Instant::now());
+            return Ok(url.into());
         }
         if !self.cli.is_file() {
             return Err(ProxyError::Invalid(format!(
@@ -102,6 +103,7 @@ impl SidecarManager {
             .map_err(ioerr)?;
         let err = log.try_clone().map_err(ioerr)?;
         let mut command = Command::new(&self.cli);
+        configure_sidecar_environment(&mut command, &self.runtime);
         command
             .args([
                 "--serve",
@@ -227,6 +229,57 @@ impl SidecarManager {
         }
     }
 }
+const SIDECAR_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSH_AUTH_SOCK",
+    "WORKBUDDY_APP_NAME",
+    "WORKBUDDY_APP_PATH",
+    "WORKBUDDY_APP_VERSION",
+    "WORKBUDDY_CONFIG_DIR",
+    "WORKBUDDY_DATA_FOLDER_NAME",
+    "WORKBUDDY_EXTRA_PATHS",
+    "WORKBUDDY_IS_PACKAGED",
+    "WORKBUDDY_LOCALE",
+    "WORKBUDDY_NODE_ENV",
+    "WORKBUDDY_PRODUCT_NAME",
+    "WORKBUDDY_PROMPT_TEMPLATES_DIR",
+    "WORKBUDDY_RESOURCES_PATH",
+    "WORKBUDDY_USER_DATA_DIR",
+    "CODEBUDDY_BUILTIN_SKILLS_DIR",
+    "CODEBUDDY_CONFIG_DIR",
+    "CODEBUDDY_HOST",
+    "CODEBUDDY_INTERNET_ENVIRONMENT",
+    "CODEBUDDY_NODE_BIN",
+];
+
+fn configure_sidecar_environment(command: &mut Command, runtime: &Path) {
+    command.env_clear();
+    for name in SIDECAR_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let capture = runtime.join(".test-sidecar-env.json");
+    if capture.exists() {
+        command.env("WORKBUDDY_PROXY_TEST_ENV_CAPTURE", capture);
+    }
+}
+
 pub fn process_matches(pid: i64, marker: &str) -> bool {
     let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;

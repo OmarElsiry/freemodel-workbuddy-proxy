@@ -176,6 +176,47 @@ pub fn chat_result(model: &str, text: &str) -> Value {
 pub fn message_output_item(text: &str, id: Option<&str>) -> Value {
     json!({"id":id.map(str::to_string).unwrap_or_else(||format!("msg_{}",&Uuid::new_v4().simple().to_string()[..24])),"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":text,"annotations":[]}]})
 }
+
+pub fn response_output_items(message: &Value) -> Vec<Value> {
+    let mut output = Vec::new();
+    let text = text_from_content(message.get("content").unwrap_or(&Value::Null));
+    if !text.is_empty() || message.get("tool_calls").is_none() {
+        output.push(message_output_item(&text, None));
+    }
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            let Some(function) = tool_call.get("function").and_then(Value::as_object) else {
+                continue;
+            };
+            let Some(name) = function.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let call_id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{}", &Uuid::new_v4().simple().to_string()[..16]));
+            let arguments = function
+                .get("arguments")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_else(|| "{}".into());
+            output.push(json!({
+                "id": format!("fc_{}", &Uuid::new_v4().simple().to_string()[..24]),
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments
+            }));
+        }
+    }
+    output
+}
 pub fn base_response(
     id: &str,
     model: &str,
@@ -208,14 +249,8 @@ pub fn chat_completion_to_response(chat: &Value, model: &str) -> Value {
         .pointer("/choices/0/message")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let text = text_from_content(message.get("content").unwrap_or(&Value::Null));
-    base_response(
-        &id,
-        model,
-        "completed",
-        vec![message_output_item(&text, None)],
-        chat.get("usage"),
-    )
+    let output = response_output_items(&message);
+    base_response(&id, model, "completed", output, chat.get("usage"))
 }
 
 #[cfg(test)]

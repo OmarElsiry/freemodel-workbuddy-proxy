@@ -1,23 +1,24 @@
 #!/bin/bash
-# Start script for Freemodel API Proxy Server & Interactive TUI
-set -e
+# Start the Rust Freemodel WorkBuddy proxy or hybrid TUI.
+set -euo pipefail
 
-DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-cd "$DIR"
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+BINARY="$DIR/target/release/freemodel-workbuddy-proxy"
 
-PORT="${PROXY_PORT:-40589}"
-HOST="${PROXY_HOST:-0.0.0.0}"
-
-if [ "$1" = "--server-only" ]; then
-    echo "Starting Freemodel API Proxy on http://$HOST:$PORT..."
-    exec python3 -m uvicorn proxy_server:app --host "$HOST" --port "$PORT"
+if [ ! -x "$BINARY" ]; then
+    echo "Building optimized Rust proxy..."
+    cargo build --release --manifest-path "$DIR/Cargo.toml"
 fi
 
-# Ensure proxy server is running in background if not already
-if ! fuser "$PORT/tcp" >/dev/null 2>&1; then
-    echo "Starting Freemodel API Proxy in background on http://$HOST:$PORT..."
-    python3 tui.py --start
-fi
-
-# Launch Interactive TUI
-python3 tui.py
+case "$#:${1:-}" in
+    0:)
+        exec "$BINARY" tui
+        ;;
+    1:--server-only)
+        exec "$BINARY" server
+        ;;
+    *)
+        echo "Usage: $0 [--server-only]" >&2
+        exit 2
+        ;;
+esac

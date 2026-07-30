@@ -9,13 +9,19 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
 use tokio::sync::{OwnedMutexGuard, mpsc};
 
+const ACP_EVENT_CHANNEL_CAPACITY: usize = 64;
+
 pub struct AcpEventStream {
-    receiver: mpsc::UnboundedReceiver<Result<NormalizedEvent, AcpError>>,
+    receiver: mpsc::Receiver<Result<NormalizedEvent, AcpError>>,
     gateway_guard: Option<OwnedMutexGuard<()>>,
 }
 impl AcpEventStream {
@@ -75,11 +81,43 @@ impl AcpTransport {
         Ok(h)
     }
     pub fn stream_chat(&self, messages: Vec<Value>) -> AcpEventStream {
-        let (tx, rx) = mpsc::unbounded_channel();
+        self.stream_chat_with_attempts(messages, 1)
+    }
+
+    pub fn stream_chat_with_attempts(
+        &self,
+        messages: Vec<Value>,
+        max_attempts: usize,
+    ) -> AcpEventStream {
+        let (tx, rx) = mpsc::channel(ACP_EVENT_CHANNEL_CAPACITY);
         let this = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = this.run(messages, &tx).await {
-                let _ = tx.send(Err(e));
+            let attempts = max_attempts.max(1);
+            let mut last_error = None;
+            for attempt in 1..=attempts {
+                let emitted = Arc::new(AtomicBool::new(false));
+                match this.run(messages.clone(), &tx, emitted.clone()).await {
+                    Ok(()) => return,
+                    Err(error) => {
+                        let can_retry = error.retryable
+                            && !emitted.load(Ordering::Acquire)
+                            && attempt < attempts;
+                        last_error = Some(error);
+                        if !can_retry || tx.is_closed() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(mut error) = last_error {
+                if attempts > 1 && error.retryable {
+                    error.message = format!(
+                        "WorkBuddy ACP failed after {attempts} attempts: {}",
+                        error.message
+                    );
+                    error.retryable = false;
+                }
+                let _ = tx.send(Err(error)).await;
             }
         });
         AcpEventStream {
@@ -90,11 +128,13 @@ impl AcpTransport {
     async fn run(
         &self,
         messages: Vec<Value>,
-        tx: &mpsc::UnboundedSender<Result<NormalizedEvent, AcpError>>,
+        tx: &mpsc::Sender<Result<NormalizedEvent, AcpError>>,
+        emitted: Arc<AtomicBool>,
     ) -> Result<(), AcpError> {
         let client = Client::builder()
             .timeout(self.timeout)
             .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(network)?;
         let mut headers = self.headers()?;
@@ -133,15 +173,16 @@ impl AcpTransport {
             self.rpc(&client,&connection,&token,2,"session/new",json!({"cwd":self.cwd,"mcpServers":[]}),|e|{if e.get("id").and_then(Value::as_i64)==Some(2){session_id=e.pointer("/result/sessionId").and_then(Value::as_str).unwrap_or("").into();}Ok(())}).await?;
             if session_id.is_empty(){return Err(AcpError::new("WorkBuddy ACP did not create a session","protocol"));}
             let prompt=serialize_messages(&messages);let mut complete=false;let mut disconnected=false;
-            self.rpc(&client,&connection,&token,3,"session/prompt",json!({"sessionId":session_id,"prompt":[{"type":"text","text":prompt}]}),|e|{if e.get("method").and_then(Value::as_str)==Some("session/update")&&e.pointer("/params/update/sessionUpdate").and_then(Value::as_str)==Some("agent_message_chunk"){if let Some(text)=e.pointer("/params/update/content/text").and_then(Value::as_str).filter(|s|!s.is_empty()){if tx.send(Ok(NormalizedEvent::TextDelta(text.into()))).is_err(){disconnected=true;}}}else if e.get("id").and_then(Value::as_i64)==Some(3){let reason=e.pointer("/result/stopReason").and_then(Value::as_str).unwrap_or("");if reason=="end_turn"{complete=true;}else{return Err(AcpError::new(format!("WorkBuddy ACP stopped with reason: {}",if reason.is_empty(){"unknown"}else{reason}),if reason=="refusal"{"refusal"}else{"upstream"}).retryable(reason=="refusal"));}}Ok(())}).await?;
+            self.rpc(&client,&connection,&token,3,"session/prompt",json!({"sessionId":session_id,"prompt":[{"type":"text","text":prompt}]}),|e|{if e.get("method").and_then(Value::as_str)==Some("session/update")&&e.pointer("/params/update/sessionUpdate").and_then(Value::as_str)==Some("agent_message_chunk"){if let Some(text)=e.pointer("/params/update/content/text").and_then(Value::as_str).filter(|s|!s.is_empty()){emitted.store(true,Ordering::Release);match tx.try_send(Ok(NormalizedEvent::TextDelta(text.into()))){Ok(())=>{},Err(mpsc::error::TrySendError::Closed(_))=>disconnected=true,Err(mpsc::error::TrySendError::Full(_))=>return Err(AcpError::new("WorkBuddy ACP downstream buffer is full","capacity")),}}}else if e.get("id").and_then(Value::as_i64)==Some(3){let reason=e.pointer("/result/stopReason").and_then(Value::as_str).unwrap_or("");if reason=="end_turn"{complete=true;}else{return Err(AcpError::new(format!("WorkBuddy ACP stopped with reason: {}",if reason.is_empty(){"unknown"}else{reason}),if reason=="refusal"{"refusal"}else{"upstream"}).retryable(reason=="refusal"));}}Ok(())}).await?;
             if disconnected { self.cancel(&client,&connection,&token,&session_id).await; return Ok(()); }
-            if !complete{return Err(AcpError::new("WorkBuddy ACP prompt ended without completion","protocol"));}let _=tx.send(Ok(NormalizedEvent::Completed));Ok(())}.await;
+            if !complete{return Err(AcpError::new("WorkBuddy ACP prompt ended without completion","protocol"));}let _=tx.send(Ok(NormalizedEvent::Completed)).await;Ok(())}.await;
         if result.is_err() && !session_id.is_empty() && tx.is_closed() {
             self.cancel(&client, &connection, &token, &session_id).await;
         }
         self.close(&client, &connection, &token).await;
         result
     }
+    #[allow(clippy::too_many_arguments)]
     async fn rpc<F>(
         &self,
         client: &Client,
@@ -158,10 +199,15 @@ impl AcpTransport {
         let mut h = self.headers()?;
         h.insert(
             "acp-connection-id",
-            HeaderValue::from_str(connection).unwrap(),
+            HeaderValue::from_str(connection)
+                .map_err(|_| AcpError::new("Invalid ACP connection id header", "protocol"))?,
         );
         if !token.is_empty() {
-            h.insert("acp-session-token", HeaderValue::from_str(token).unwrap());
+            h.insert(
+                "acp-session-token",
+                HeaderValue::from_str(token)
+                    .map_err(|_| AcpError::new("Invalid ACP session token header", "protocol"))?,
+            );
         }
         let response = client
             .post(format!("{}/api/v1/acp", self.base_url))
@@ -177,7 +223,10 @@ impl AcpTransport {
         let mut stream = response.bytes_stream();
         let mut found = false;
         while let Some(chunk) = stream.next().await {
-            for line in decoder.push(&chunk.map_err(network)?) {
+            for line in decoder
+                .push(&chunk.map_err(network)?)
+                .map_err(|error| AcpError::new(error.to_string(), "protocol"))?
+            {
                 if let Some(v) = parse_data(&line)? {
                     if v.get("id").and_then(Value::as_i64) == Some(id) {
                         if let Some(error) = v.get("error") {
@@ -205,13 +254,15 @@ impl AcpTransport {
                 }
             }
         }
-        if let Some(line) = decoder.finish() {
-            if let Some(v) = parse_data(&line)? {
-                if v.get("id").and_then(Value::as_i64) == Some(id) {
-                    found = true;
-                }
-                event(&v)?;
+        if let Some(line) = decoder
+            .finish()
+            .map_err(|error| AcpError::new(error.to_string(), "protocol"))?
+            && let Some(v) = parse_data(&line)?
+        {
+            if v.get("id").and_then(Value::as_i64) == Some(id) {
+                found = true;
             }
+            event(&v)?;
         }
         if !found {
             return Err(AcpError::new(
@@ -263,10 +314,8 @@ pub fn serialize_messages(messages: &[Value]) -> String {
         let mut content =
             crate::openai::text_from_content(m.get("content").unwrap_or(&Value::Null));
         if let Some(calls) = m.get("tool_calls") {
-            content.push_str(&format!(
-                "\nTOOL_CALLS: {}",
-                serde_json::to_string(calls).unwrap()
-            ));
+            content.push_str("\nTOOL_CALLS: ");
+            content.push_str(&calls.to_string());
         }
         if role == "TOOL" {
             role = format!(

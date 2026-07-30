@@ -27,7 +27,7 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum KeyCommand {
-    Set { value: String },
+    Set { value: Option<String> },
 }
 
 #[tokio::main]
@@ -56,6 +56,13 @@ async fn main() -> Result<()> {
         Command::Key {
             command: KeyCommand::Set { value },
         } => {
+            let value = match value {
+                Some(value) => value,
+                None => freemodel_workbuddy_proxy::tui::setup::read_secret("Freemodel API key")?,
+            };
+            if value.trim().is_empty() {
+                anyhow::bail!("API key was empty; configuration was not changed");
+            }
             config.save_api_key(&value)?;
             println!("API key saved.");
         }

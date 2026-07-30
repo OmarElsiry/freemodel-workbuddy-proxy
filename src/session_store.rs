@@ -2,7 +2,7 @@ use crate::{error::ProxyError, models::SessionRecord};
 use chrono::Utc;
 use fs2::FileExt;
 use regex::Regex;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
@@ -47,6 +47,7 @@ impl SessionStore {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .mode(0o600)
             .open(self.lock_path())
             .map_err(ioerr)?;
@@ -60,10 +61,10 @@ impl SessionStore {
                 .cloned()
                 .ok_or_else(|| ProxyError::Internal("Invalid proxy session store format".into()))?
         } else {
-            json!({"version":1,"sessions":{}})
-                .as_object()
-                .unwrap()
-                .clone()
+            let mut initial = Map::new();
+            initial.insert("version".into(), Value::from(1));
+            initial.insert("sessions".into(), Value::Object(Map::new()));
+            initial
         };
         if data.get("version").and_then(Value::as_u64) != Some(1)
             || !data.get("sessions").is_some_and(Value::is_object)
@@ -81,11 +82,12 @@ impl SessionStore {
     }
     fn atomic_write(&self, value: &Value) -> Result<(), ProxyError> {
         let parent = self.path.parent().unwrap_or(Path::new("."));
+        let file_name = self
+            .path
+            .file_name()
+            .ok_or_else(|| ProxyError::Internal("Invalid session store path".into()))?;
         let mut temp = tempfile::Builder::new()
-            .prefix(&format!(
-                ".{}.",
-                self.path.file_name().unwrap().to_string_lossy()
-            ))
+            .prefix(&format!(".{}.", file_name.to_string_lossy()))
             .tempfile_in(parent)
             .map_err(ioerr)?;
         temp.as_file()
@@ -166,11 +168,14 @@ impl SessionStore {
                 sidecar: Map::new(),
                 extra: Map::new(),
             };
-            d.get_mut("sessions")
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .insert(id, serde_json::to_value(&record).unwrap());
+            let sessions = d
+                .get_mut("sessions")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| ProxyError::Internal("Invalid proxy session store format".into()))?;
+            sessions.insert(
+                id,
+                serde_json::to_value(&record).map_err(|e| ProxyError::Internal(e.to_string()))?,
+            );
             Ok(record)
         })
     }
@@ -199,10 +204,10 @@ impl SessionStore {
                 .and_then(|s| s.get_mut(&id))
                 .ok_or_else(|| ProxyError::NotFound("Unknown proxy session".into()))?;
             let mut r: SessionRecord = serde_json::from_value(value.clone()).map_err(formaterr)?;
-            if let Some(t) = title {
-                if !t.is_empty() {
-                    r.title = t.chars().take(120).collect();
-                }
+            if let Some(t) = title
+                && !t.is_empty()
+            {
+                r.title = t.chars().take(120).collect();
             }
             if let Some(h) = history {
                 validate_history(&h)?;
@@ -219,7 +224,7 @@ impl SessionStore {
                 r.sidecar = s;
             }
             r.updated_at = Utc::now().to_rfc3339();
-            *value = serde_json::to_value(&r).unwrap();
+            *value = serde_json::to_value(&r).map_err(|e| ProxyError::Internal(e.to_string()))?;
             Ok(r)
         })
     }
@@ -229,12 +234,30 @@ impl SessionStore {
         messages: Vec<Value>,
     ) -> Result<SessionRecord, ProxyError> {
         validate_history(&messages)?;
-        let mut r = self
-            .get(id)
-            .await?
-            .ok_or_else(|| ProxyError::NotFound("Unknown proxy session".into()))?;
-        r.history.extend(messages);
-        self.update(id, None, Some(r.history), None).await
+        let id = validate_session_id(id)?.to_string();
+        let _g = self.lock.lock().await;
+        self.with_data(true, |data| {
+            let value = data
+                .get_mut("sessions")
+                .and_then(Value::as_object_mut)
+                .and_then(|sessions| sessions.get_mut(&id))
+                .ok_or_else(|| ProxyError::NotFound("Unknown proxy session".into()))?;
+            let mut record: SessionRecord =
+                serde_json::from_value(value.clone()).map_err(formaterr)?;
+            record.history.extend(messages);
+            if record.history.len() > self.max_history_messages {
+                record.history.drain(
+                    ..record
+                        .history
+                        .len()
+                        .saturating_sub(self.max_history_messages),
+                );
+            }
+            record.updated_at = Utc::now().to_rfc3339();
+            *value = serde_json::to_value(&record)
+                .map_err(|error| ProxyError::Internal(error.to_string()))?;
+            Ok(record)
+        })
     }
     pub async fn clear_sidecar(&self, id: &str) -> Result<SessionRecord, ProxyError> {
         self.update(id, None, None, Some(Map::new())).await
@@ -244,9 +267,8 @@ impl SessionStore {
         let _g = self.lock.lock().await;
         self.with_data(true, |d| {
             Ok(d.get_mut("sessions")
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| ProxyError::Internal("Invalid proxy session store format".into()))?
                 .remove(&id)
                 .is_some())
         })
@@ -254,10 +276,10 @@ impl SessionStore {
     pub async fn clear_stale_runtime(&self) -> Result<(), ProxyError> {
         let sessions = self.list(None).await?;
         for r in sessions {
-            if let Some(pid) = r.sidecar.get("pid").and_then(Value::as_i64) {
-                if !Path::new(&format!("/proc/{pid}")).exists() {
-                    self.clear_sidecar(&r.id).await?;
-                }
+            if let Some(pid) = r.sidecar.get("pid").and_then(Value::as_i64)
+                && !Path::new(&format!("/proc/{pid}")).exists()
+            {
+                self.clear_sidecar(&r.id).await?;
             }
         }
         Ok(())
@@ -330,9 +352,9 @@ pub fn automatic_session_id(project: &str, messages: &[Value]) -> Result<String,
     Ok(format!("auto-{}", &format!("{:x}", h.finalize())[..24]))
 }
 fn records(d: &Map<String, Value>) -> Result<Vec<SessionRecord>, ProxyError> {
-    d["sessions"]
-        .as_object()
-        .unwrap()
+    d.get("sessions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ProxyError::Internal("Invalid proxy session store format".into()))?
         .values()
         .cloned()
         .map(|v| serde_json::from_value(v).map_err(formaterr))

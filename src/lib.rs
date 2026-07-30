@@ -8,4 +8,5 @@ pub mod server;
 pub mod session_store;
 pub mod sidecar;
 pub mod sse;
+#[path = "tui/mod.rs"]
 pub mod tui;

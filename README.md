@@ -7,7 +7,7 @@ A high-performance, OpenAI-compatible proxy server and Terminal User Interface (
 ## 🌟 Features
 
 - ⚡ **OpenAI Compatibility**: Emulates `/v1/chat/completions`, `/v1/models`, and `/v1/responses`.
-- 💬 **Interactive TUI**: Included terminal chat client (`tui.py`) with rich UI, live response streaming, and interactive key setup.
+- 💬 **Interactive Rust TUI**: Full-screen Ratatui workspace with guided setup, validated live streaming, session/model/project pickers, retry/edit/cancel controls, search, diagnostics, logs, preferences, and masked key setup.
 - 🔑 **Automatic Key Resolution**: Auto-detects and persists API keys locally in `config.json` or reads existing keys from `~/.codex/auth.json`.
 - 🔄 **Native Incremental Streaming**: Forwards direct HTTP and WorkBuddy ACP deltas immediately for both Chat Completions and Responses API clients.
 - 🧰 **Function Tool Translation**: Converts Responses function definitions, calls, and outputs to and from Chat Completions tool-call format.
@@ -48,6 +48,7 @@ Optional ACP settings are `WORKBUDDY_ACP_TIMEOUT` and `WORKBUDDY_ACP_MAX_ATTEMPT
 - `PROXY_SIDECAR_STARTUP_TIMEOUT`: maximum sidecar startup wait.
 - `PROXY_SIDECAR_IDLE_TIMEOUT`: seconds before an inactive sidecar is stopped; its session metadata remains reusable.
 - `PROXY_MAX_HISTORY_TURNS`: number of user/assistant turn pairs retained for the TUI.
+- `PROXY_API_KEY`: optional Bearer key required by `/v1/models`, `/v1/chat/completions`, and `/v1/responses`. Loopback-only management and health routes remain available locally. When enabled, the proxy uses `FREEMODEL_API_KEY` for the direct upstream instead of forwarding the proxy credential.
 
 `WORKBUDDY_ACP_URL`, `WORKBUDDY_ACP_CWD`, and `WORKBUDDY_ACP_PASSWORD` remain available for legacy/manual ACP use, but normal protected-host requests are resolved to a proxy-owned sidecar. Never commit gateway passwords or API keys.
 
@@ -69,15 +70,19 @@ The proxy session ID is independent from WorkBuddy GUI conversation IDs. Session
 
 ### TUI workflow
 
-Running `python3 tui.py` now:
+Running `./start.sh` opens the Rust hybrid TUI:
 
-1. asks for a project directory;
-2. lists only proxy-owned sessions for that project;
-3. lets you create a new session or reopen an old one;
-4. restores the selected session's saved TUI history;
-5. routes requests through that session's dedicated sidecar.
+1. verifies or starts the compatible local Rust proxy and reports actionable startup failures;
+2. asks for a project directory with recent-project choices;
+3. lists only proxy-owned sessions for that project and rejects invalid selections;
+4. lets you create a new session or reopen an old one;
+5. restores saved history and routes through the selected session's dedicated sidecar;
+6. opens a full-screen, resize-safe chat workspace with multiline input, validated streaming, cancellation, retry/edit-resend, transcript search, model and project selection, diagnostics, a bounded sanitized proxy-log view, and persisted non-secret preferences;
+7. uses full-transcript replacement after retry/edit so corrected turns replace saved history rather than duplicating old turns.
 
-Sidecar processes are temporary. An idle sidecar is stopped after `PROXY_SIDECAR_IDLE_TIMEOUT`, while the session title, project, and history stay available. Selecting or addressing that session again starts a new sidecar automatically. The proxy writes session metadata and sidecar log files with owner-only permissions (`0600`) and keeps runtime directories private (`0700`).
+Press `F1` or type `/help` for all shortcuts and commands. Common actions include `Ctrl+O` session picker, `Ctrl+P` project switch, `Ctrl+M` model picker, `Ctrl+R` retry, `Ctrl+E` edit/resend, `Esc` cancel/close, and `Ctrl+Q` safe exit. Session commands include `/new`, `/sessions`, `/switch`, `/rename`, `/clear`, and `/delete`; destructive commands require confirmation.
+
+Sidecar processes are temporary. An idle sidecar is stopped after `PROXY_SIDECAR_IDLE_TIMEOUT`, while the session title, project, and history stay available. Selecting or addressing that session again starts a new sidecar automatically. The proxy writes session metadata and sidecar log files with owner-only permissions (`0600`), keeps runtime directories private (`0700`), and launches each sidecar with a minimized environment that excludes proxy credentials, provider API keys, gateway passwords, and dynamic-loader injection variables.
 
 ### Codex and OpenAI-compatible clients
 
@@ -111,8 +116,12 @@ Management routes are loopback-only:
 - `GET /proxy/sessions`
 - `POST /proxy/sessions`
 - `GET /proxy/sessions/{session_id}`
+- `PATCH /proxy/sessions/{session_id}`
 - `POST /proxy/sessions/{session_id}/history`
+- `PUT /proxy/sessions/{session_id}/history`
+- `DELETE /proxy/sessions/{session_id}/history`
 - `DELETE /proxy/sessions/{session_id}`
+- `GET /proxy/diagnostics`
 
 Deleting a session stops only a process whose PID and command line match the proxy-owned sidecar marker.
 
@@ -120,22 +129,30 @@ Deleting a session stops only a process whose PID and command line match the pro
 
 ## 🚀 Quick Start
 
-### 1. Launch Interactive TUI & Proxy
+### 1. Launch the hybrid TUI and proxy
+
 ```bash
 ./start.sh
 ```
-*or*
+
+Or build and run it directly:
+
 ```bash
-python3 tui.py
+cargo run --release -- tui
 ```
 
-### 2. Run Server Only (Background or Foreground)
-```bash
-# Foreground
-python3 proxy_server.py
+### 2. Run the server only
 
-# Or via start script
+```bash
 ./start.sh --server-only
+# or
+cargo run --release -- server
+```
+
+Configure the API key without exposing it as a process argument:
+
+```bash
+cargo run --release -- key set
 ```
 
 ---
@@ -150,15 +167,14 @@ python3 proxy_server.py
 
 ## 🧪 Testing
 
-Run the isolated unit and protocol suite:
+Run the Rust unit, protocol, API, and TUI suite:
 
 ```bash
-python3 -m unittest discover -s . -p "test_*.py" -v
+cargo fmt --check
+cargo check --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+cargo test --release --all-targets
 ```
 
-With a proxy already running on port `40589`, optional live endpoint checks are:
-
-```bash
-python3 test_proxy.py
-python3 test_all_edge_cases.py
-```
+The Python implementation remains temporarily available only as a differential compatibility oracle until the wider Rust migration reaches final cutover.

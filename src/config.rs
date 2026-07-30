@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
     env, fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -84,7 +86,7 @@ impl Config {
         let home = environment
             .get("HOME")
             .map(PathBuf::from)
-            .or_else(|| env::home_dir())
+            .or_else(env::home_dir)
             .unwrap_or_else(|| PathBuf::from("."));
         let mut api_key = text("FREEMODEL_API_KEY", "").trim().to_string();
         if api_key.is_empty() {
@@ -125,7 +127,10 @@ impl Config {
             get("PROXY_MAX_SIDECARS", Value::from(8)),
             "PROXY_MAX_SIDECARS",
         )?;
-        if startup <= 0.0
+        if !startup.is_finite()
+            || !acp_timeout.is_finite()
+            || !idle.is_finite()
+            || startup <= 0.0
             || acp_timeout <= 0.0
             || attempts == 0
             || max_history == 0
@@ -216,8 +221,23 @@ impl Config {
         object.insert("FREEMODEL_API_KEY".into(), Value::String(key.trim().into()));
         let bytes =
             serde_json::to_vec_pretty(&object).map_err(|e| ProxyError::Internal(e.to_string()))?;
-        fs::write(&self.config_file, bytes)
-            .map_err(|e| ProxyError::Internal(format!("Unable to save API key: {e}")))
+        let parent = self.config_file.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|e| ProxyError::Internal(format!("Unable to create config directory: {e}")))?;
+        let mut temp = tempfile::Builder::new()
+            .prefix(".freemodel-config.")
+            .tempfile_in(parent)
+            .map_err(|e| ProxyError::Internal(format!("Unable to create config file: {e}")))?;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| ProxyError::Internal(format!("Unable to protect config file: {e}")))?;
+        temp.write_all(&bytes)
+            .and_then(|_| temp.as_file().sync_all())
+            .map_err(|e| ProxyError::Internal(format!("Unable to save API key: {e}")))?;
+        temp.persist(&self.config_file)
+            .map_err(|e| ProxyError::Internal(format!("Unable to save API key: {}", e.error)))?;
+        fs::set_permissions(&self.config_file, fs::Permissions::from_mode(0o600))
+            .map_err(|e| ProxyError::Internal(format!("Unable to protect config file: {e}")))
     }
 }
 

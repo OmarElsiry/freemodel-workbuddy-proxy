@@ -32,13 +32,12 @@ impl GatewayLocks {
     }
 }
 
-pub async fn resolve(
+pub async fn resolve_session(
     headers: &HeaderMap,
     messages: &[Value],
     store: &SessionStore,
-    sidecars: &SidecarManager,
     default_project: &str,
-) -> Result<(SessionRecord, String), ProxyError> {
+) -> Result<SessionRecord, ProxyError> {
     let requested = headers
         .get("x-workbuddy-session")
         .and_then(|v| v.to_str().ok())
@@ -74,10 +73,58 @@ pub async fn resolve(
         }
         session
     };
+    Ok(session)
+}
+
+pub async fn resolve(
+    headers: &HeaderMap,
+    messages: &[Value],
+    store: &SessionStore,
+    sidecars: &SidecarManager,
+    default_project: &str,
+) -> Result<(SessionRecord, String), ProxyError> {
+    let session = resolve_session(headers, messages, store, default_project).await?;
     let url = sidecars.ensure(&session).await.map_err(|e| {
         ProxyError::Acp(
             AcpError::new(e.to_string(), "configuration").status(StatusCode::SERVICE_UNAVAILABLE),
         )
     })?;
     Ok((session, url))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GatewayLocks;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn same_gateway_serializes_and_releases_after_drop() {
+        let locks = GatewayLocks::default();
+        let first = locks.acquire("http://gateway").await;
+        let second_locks = locks.clone();
+        let mut second = tokio::spawn(async move { second_locks.acquire("http://gateway").await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second)
+                .await
+                .is_err()
+        );
+        second.abort();
+        drop(first);
+        let guard = tokio::time::timeout(Duration::from_secs(1), locks.acquire("http://gateway"))
+            .await
+            .expect("lock is released after the owner drops");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn different_gateways_do_not_block_each_other() {
+        let locks = GatewayLocks::default();
+        let _first = locks.acquire("http://gateway-a").await;
+        let second = tokio::time::timeout(
+            Duration::from_millis(100),
+            locks.acquire("http://gateway-b"),
+        )
+        .await;
+        assert!(second.is_ok());
+    }
 }

@@ -1,25 +1,63 @@
-# Byte-compiled / optimized / DLL files
+# Rust build output
+target/
+
+# Byte-compiled / optimized / DLL files (temporary Python oracle)
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Configuration & Secrets
+# Configuration and secrets
 config.json
+config.local.json
 .env
 .env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
 
-# Logs and proxy-owned runtime state
+# Logs, coverage, and test-generated artifacts
 *.log
+*.pid
+*.profraw
+*.profdata
+coverage/
+coverage-*.json
+lcov.info
+junit*.xml
+.pytest_cache/
+.coverage
+htmlcov/
 proxy_server.log
+.smoke-*
+.codex-smoke-*
+
+# Proxy-owned runtime state
 .proxy-sessions.json
+.proxy-sessions.lock
 .proxy-runtime/
 
-# Environments
+# Python environments and caches
 .venv/
 venv/
 ENV/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
 
-# OS / Editor files
+# Local tooling and editor files
 .DS_Store
+Thumbs.db
 .vscode/
 .idea/
+*.swp
+*.swo
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.bak
+*~
