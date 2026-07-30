@@ -6,6 +6,61 @@ use freemodel_workbuddy_proxy::{
     sse::SseDecoder,
     tui::{commands, composer::Composer, event, terminal::sanitize},
 };
+use predicates::prelude::PredicateBooleanExt;
+use std::{os::unix::fs::PermissionsExt, process::Command};
+
+#[test]
+fn launcher_rejects_invalid_arguments_before_build_work() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert_cmd::assert::Assert::new(
+        Command::new("bash")
+            .arg(root.join("start.sh"))
+            .arg("--unsupported")
+            .current_dir(root)
+            .output()
+            .unwrap(),
+    )
+    .failure()
+    .code(2)
+    .stderr(predicates::str::contains("Usage:").and(predicates::str::contains("[--server-only]")))
+    .stdout(predicates::str::is_empty());
+}
+
+#[test]
+fn launcher_always_delegates_freshness_to_cargo() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir().unwrap();
+    let cargo = temp.path().join("cargo");
+    let log = temp.path().join("cargo.log");
+    std::fs::write(
+        &cargo,
+        "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$CARGO_LOG\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        temp.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("timeout")
+        .args(["1s", "bash"])
+        .arg(root.join("start.sh"))
+        .arg("--server-only")
+        .current_dir(root)
+        .env("PATH", path)
+        .env("CARGO_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(matches!(output.status.code(), Some(124 | 143)));
+    assert_eq!(
+        std::fs::read_to_string(log).unwrap(),
+        format!(
+            "build --release --manifest-path {}/Cargo.toml\n",
+            root.display()
+        )
+    );
+}
 
 #[test]
 fn tui_parser_preserves_fragmented_sse_lines() {

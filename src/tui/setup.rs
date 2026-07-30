@@ -39,7 +39,7 @@ pub async fn ensure_server(config: &Config) -> Result<ServerHandle> {
             });
         }
         Err(message) if !message.contains("Could not connect") => anyhow::bail!(
-            "Port {} is occupied by an incompatible service: {message}",
+            "Port {} is occupied by an incompatible or stale service: {message}. Stop that service or configure a different PROXY_PORT",
             config.port
         ),
         Err(_) => {}

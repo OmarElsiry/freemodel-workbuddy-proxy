@@ -24,11 +24,15 @@ pub struct Health {
     #[serde(default)]
     pub version: String,
     #[serde(default)]
+    pub build_id: String,
+    #[serde(default)]
     pub uptime_seconds: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Diagnostics {
     pub version: String,
+    #[serde(default)]
+    pub build_id: String,
     pub uptime_seconds: u64,
     pub bind_url: String,
     pub transport: String,
@@ -72,6 +76,24 @@ pub struct StreamRequest {
     pub messages: Vec<Value>,
 }
 
+fn validate_health(health: &Health) -> Result<(), String> {
+    if health.service != "freemodel-proxy" || health.status != "ok" {
+        return Err("The configured port is not a compatible Freemodel proxy".into());
+    }
+    if health.build_id != crate::BUILD_ID {
+        return Err(format!(
+            "The configured port is running a different Freemodel proxy build (expected {}, received {})",
+            crate::BUILD_ID,
+            if health.build_id.is_empty() {
+                "legacy build without an identity"
+            } else {
+                &health.build_id
+            }
+        ));
+    }
+    Ok(())
+}
+
 impl ProxyClient {
     pub fn new(
         base: impl Into<String>,
@@ -99,9 +121,7 @@ impl ProxyClient {
             .json::<Health>()
             .await
             .map_err(clean)?;
-        if h.service != "freemodel-proxy" || h.status != "ok" {
-            return Err("The configured port is not a compatible Freemodel proxy".into());
-        }
+        validate_health(&h)?;
         Ok(h)
     }
     pub async fn diagnostics(&self) -> Result<Diagnostics, String> {
@@ -415,4 +435,39 @@ fn extract_error(text: &str) -> String {
                 clean
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Health, validate_health};
+
+    fn health(build_id: &str) -> Health {
+        Health {
+            status: "ok".into(),
+            service: "freemodel-proxy".into(),
+            upstream: "https://example.invalid/v1".into(),
+            transport: "http".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build_id: build_id.into(),
+            uptime_seconds: 1,
+        }
+    }
+
+    #[test]
+    fn accepts_the_current_server_build() {
+        assert!(validate_health(&health(crate::BUILD_ID)).is_ok());
+    }
+
+    #[test]
+    fn rejects_legacy_server_without_build_identity() {
+        let error = validate_health(&health("")).unwrap_err();
+        assert!(error.contains("legacy build without an identity"));
+    }
+
+    #[test]
+    fn rejects_a_different_server_build() {
+        let error = validate_health(&health("older-build")).unwrap_err();
+        assert!(error.contains("different Freemodel proxy build"));
+        assert!(error.contains("older-build"));
+    }
 }

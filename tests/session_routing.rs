@@ -182,6 +182,20 @@ async fn management_crud_and_validation() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 #[tokio::test]
+async fn health_exposes_current_build_identity() {
+    let (_root, state, _project) = state();
+    let response = router(state)
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let health: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(health["service"], "freemodel-proxy");
+    assert_eq!(health["build_id"], freemodel_workbuddy_proxy::BUILD_ID);
+}
+
+#[tokio::test]
 async fn management_rename_clear_history_and_diagnostics() {
     let (_root, state, project) = state();
     let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
@@ -271,6 +285,7 @@ async fn management_rename_clear_history_and_diagnostics() {
     let diagnostics: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(diagnostics["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(diagnostics["build_id"], freemodel_workbuddy_proxy::BUILD_ID);
     assert!(diagnostics["uptime_seconds"].as_u64().is_some());
     assert!(diagnostics.get("active_sidecars").is_some());
 }

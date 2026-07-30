@@ -163,7 +163,7 @@ pub fn router(state: AppState) -> Router {
 
 async fn health(State(s): State<AppState>) -> Json<Value> {
     Json(
-        json!({"status":"ok","service":"freemodel-proxy","version":env!("CARGO_PKG_VERSION"),"uptime_seconds":s.started_at.elapsed().as_secs(),"upstream":s.config.base_url,"transport":s.config.transport}),
+        json!({"status":"ok","service":"freemodel-proxy","version":env!("CARGO_PKG_VERSION"),"build_id":crate::BUILD_ID,"uptime_seconds":s.started_at.elapsed().as_secs(),"upstream":s.config.base_url,"transport":s.config.transport}),
     )
 }
 async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
@@ -317,6 +317,7 @@ async fn diagnostics(
         .unwrap_or_default();
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "build_id": crate::BUILD_ID,
         "uptime_seconds": s.started_at.elapsed().as_secs(),
         "bind_url": format!("http://{}:{}", s.config.host, s.config.port),
         "transport": s.config.transport,
