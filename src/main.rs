@@ -18,7 +18,10 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    Server,
+    Server {
+        #[arg(long, value_name = "DIRECTORY")]
+        project: Option<PathBuf>,
+    },
     Tui,
     Key {
         #[command(subcommand)]
@@ -72,13 +75,30 @@ async fn main() -> Result<()> {
         .unwrap_or(std::env::current_dir()?);
     let command = cli.command.unwrap_or(Command::Tui);
     let mut config = Config::load(&root)?;
+    if let Command::Server {
+        project: Some(project),
+    } = &command
+    {
+        config.default_project = std::fs::canonicalize(project).map_err(|_| {
+            anyhow::anyhow!(
+                "Server project directory does not exist: {}",
+                project.display()
+            )
+        })?;
+        if !config.default_project.is_dir() {
+            anyhow::bail!(
+                "Server project is not a directory: {}",
+                config.default_project.display()
+            );
+        }
+    }
     if matches!(command, Command::Tui) {
         config = ensure_tui_api_key(&root, config, || {
             freemodel_workbuddy_proxy::tui::setup::read_secret("Freemodel API key")
         })?;
     }
     match command {
-        Command::Server => serve(AppState::new(config)?).await?,
+        Command::Server { .. } => serve(AppState::new(config)?).await?,
         Command::Tui => freemodel_workbuddy_proxy::tui::run(&config).await?,
         Command::Key {
             command: KeyCommand::Set { value },

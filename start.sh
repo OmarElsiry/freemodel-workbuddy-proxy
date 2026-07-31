@@ -12,6 +12,7 @@ if [[ -f "$DIR/config.json" ]]; then
     unset FREEMODEL_API_KEY FREEMODEL_BASE_URL FREEMODEL_TRANSPORT WORKBUDDY_ACP_URL WORKBUDDY_ACP_PASSWORD
 fi
 
+SERVER_ARGS=()
 case "$#:${1:-}" in
     0:)
         MODE="tui"
@@ -19,8 +20,16 @@ case "$#:${1:-}" in
     1:--server-only)
         MODE="server"
         ;;
+    3:--server-only)
+        if [[ "${2:-}" != "--project" || -z "${3:-}" ]]; then
+            echo "Usage: $0 [--server-only [--project DIRECTORY]]" >&2
+            exit 2
+        fi
+        MODE="server"
+        SERVER_ARGS=(--project "$3")
+        ;;
     *)
-        echo "Usage: $0 [--server-only]" >&2
+        echo "Usage: $0 [--server-only [--project DIRECTORY]]" >&2
         exit 2
         ;;
 esac
@@ -30,4 +39,4 @@ esac
 echo "Ensuring optimized Rust proxy is current..."
 cargo build --release --manifest-path "$DIR/Cargo.toml"
 
-exec "$BINARY" "$MODE"
+exec "$BINARY" "$MODE" "${SERVER_ARGS[@]}"

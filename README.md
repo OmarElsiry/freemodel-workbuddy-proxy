@@ -110,7 +110,13 @@ curl -sS -X POST http://127.0.0.1:40589/proxy/sessions \
 curl -sS "http://127.0.0.1:40589/proxy/sessions?project=/absolute/path/to/project"
 ```
 
-If a client cannot set custom headers, omit them. The proxy derives a stable automatic session from the canonical project and the earliest system/developer/user context, and returns the resolved ID in `X-WorkBuddy-Session`. Set `PROXY_DEFAULT_PROJECT` correctly for headerless clients. For reliable resume behavior across client restarts, explicit session headers are preferred.
+If a client cannot set custom headers, omit them. The proxy derives a stable automatic session from the canonical project and the earliest system/developer/user context, and returns the resolved ID in `X-WorkBuddy-Session`. Set `PROXY_DEFAULT_PROJECT` correctly for headerless clients, or start server-only mode with an explicit workspace:
+
+```bash
+./start.sh --server-only --project /absolute/path/to/project
+```
+
+The selected path is canonicalized and must already be a directory. Successful Chat Completions and Responses requests return both `X-WorkBuddy-Session` and `X-WorkBuddy-Project`; `GET /proxy/diagnostics` also reports `default_project`, so you can verify where a headerless client is routed. For reliable resume behavior across client restarts, explicit session headers are preferred.
 
 Management routes are loopback-only:
 
@@ -180,6 +186,16 @@ wire_api = "responses"
 ```
 
 Set `OPENAI_API_KEY` to the configured `PROXY_API_KEY`. When proxy authentication is disabled, use a non-empty local placeholder such as `local-proxy` if the client requires a credential; the proxy ignores that value for upstream authentication and uses its private `FREEMODEL_API_KEY`. This provider configuration was smoke-tested with Codex CLI `0.146.0`. A `429 Credits exhausted` response comes from the logged-in WorkBuddy account, not from local proxy connectivity.
+
+### Codex project files and images
+
+Open Codex App on the intended project, or launch Codex CLI from that directory. Codex's own filesystem and image tools—not the proxy—read files under the workspace and return only the requested results through the Responses function-call loop. For a client that cannot send `X-WorkBuddy-Project`, start the proxy with the same path using `./start.sh --server-only --project /absolute/path/to/project` (or set `PROXY_DEFAULT_PROJECT`). Verify it through `X-WorkBuddy-Project` or `/proxy/diagnostics`.
+
+The proxy deliberately does **not** scan, enumerate, or upload the project directory. It does not add a proxy-owned `read_file` endpoint and does not grant access outside the selected workspace. Direct HTTP Responses requests preserve Codex function definitions, calls, and outputs so Codex can perform file operations under its own sandbox and permission policy.
+
+For vision input, direct HTTP accepts OpenAI Responses `input_image` blocks whose `image_url` is HTTP(S) or a `data:image/...` URL and converts them without dereferencing the URL. Existing Chat Completions `image_url` blocks are preserved. Bare local paths, `file://` URLs, and `file_id` references return an explicit `400` instead of being silently discarded: let Codex use its normal image/file tool to read the workspace image, or submit encoded image content. The proxy never opens or base64-encodes local images automatically.
+
+The protected WorkBuddy ACP transport remains project-scoped—its sidecar and ACP session use the canonical project as their working directory—but client-supplied function tools are not supported by that transport. Use the direct HTTP transport for the complete Codex Responses tool loop and encoded vision inputs.
 
 The default `PROXY_HOST=127.0.0.1` is intentionally available only on the same computer. For another trusted device on your LAN, set both `PROXY_HOST=0.0.0.0` and a strong non-empty `PROXY_API_KEY`, allow TCP port `40589` only on the private firewall zone, and use `http://<this-computer-LAN-IP>:40589/v1`. Do not expose an unauthenticated wildcard bind to a LAN or the public internet.
 

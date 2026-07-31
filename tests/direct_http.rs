@@ -171,6 +171,7 @@ async fn direct_nonstreaming_uses_configured_upstream_auth_and_converts_response
     let mut config = (*state.config).clone();
     config.api_key = "configured-upstream-key".into();
     state.config = std::sync::Arc::new(config);
+    let default_project = state.config.default_project.to_string_lossy().to_string();
     let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],
         40000,
@@ -187,6 +188,13 @@ async fn direct_nonstreaming_uses_configured_upstream_auth_and_converts_response
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().contains_key("x-workbuddy-session"));
+    assert_eq!(
+        response
+            .headers()
+            .get("x-workbuddy-project")
+            .and_then(|value| value.to_str().ok()),
+        Some(default_project.as_str())
+    );
     let body: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["object"], "response");
@@ -199,6 +207,73 @@ async fn direct_nonstreaming_uses_configured_upstream_auth_and_converts_response
     assert_eq!(upstream["model"], "gpt-5.6-sol");
     assert_eq!(upstream["messages"][0]["content"], "hello");
     assert_eq!(upstream["stream"], false);
+}
+
+#[tokio::test]
+async fn direct_responses_preserves_codex_tools_and_images_without_reading_project_files() {
+    let (base, recorded) = recording_upstream().await;
+    let (root, state) = direct_state(&base);
+    let secret_path = root.path().join("project/private.txt");
+    std::fs::write(&secret_path, "MUST_NOT_BE_UPLOADED").unwrap();
+    let response = router(state)
+        .layer(MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            40000,
+        ))))
+        .oneshot(
+            Request::post("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "input":[{
+                            "type":"message",
+                            "role":"user",
+                            "content":[
+                                {"type":"input_text","text":"Inspect only when requested"},
+                                {"type":"input_image","image_url":"data:image/png;base64,AA=="}
+                            ]
+                        }],
+                        "tools":[{
+                            "type":"function",
+                            "name":"read_file",
+                            "description":"Read a workspace file",
+                            "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+                        }]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let upstream = recorded.body.lock().unwrap().clone().unwrap();
+    assert_eq!(upstream["tools"][0]["function"]["name"], "read_file");
+    assert_eq!(
+        upstream["messages"][0]["content"][1]["image_url"]["url"],
+        "data:image/png;base64,AA=="
+    );
+    assert!(!upstream.to_string().contains("MUST_NOT_BE_UPLOADED"));
+    assert!(
+        !upstream
+            .to_string()
+            .contains(secret_path.to_string_lossy().as_ref())
+    );
+}
+
+#[tokio::test]
+async fn direct_responses_rejects_local_image_paths_before_upstream() {
+    let (base, recorded) = recording_upstream().await;
+    let (_root, state) = direct_state(&base);
+    let (status, body) = request_stream(
+        state,
+        "/v1/responses",
+        r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_image","image_url":"/tmp/local.png"}]}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("Local image paths"), "{body}");
+    assert!(recorded.body.lock().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -364,6 +439,7 @@ async fn direct_chat_consumes_unterminated_final_sse_line() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.contains_key("x-workbuddy-session"));
+    assert!(headers.contains_key("x-workbuddy-project"));
     assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
     assert!(!body.contains("\"error\""), "{body}");
 }
@@ -483,6 +559,7 @@ async fn direct_responses_consumes_unterminated_done_line() {
             .await;
     assert_eq!(status, StatusCode::OK);
     assert!(headers.contains_key("x-workbuddy-session"));
+    assert!(headers.contains_key("x-workbuddy-project"));
     assert_eq!(
         body.matches("event: response.completed").count(),
         1,

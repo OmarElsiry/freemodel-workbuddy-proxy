@@ -324,6 +324,7 @@ async fn diagnostics(
         "upstream_host": upstream_host,
         "session_store": s.config.session_store,
         "runtime_dir": s.config.runtime_dir,
+        "default_project": s.config.default_project,
         "active_sidecars": active_sidecars,
         "max_sidecars": s.config.max_sidecars,
         "rss_bytes": rss_bytes
@@ -379,7 +380,17 @@ fn json_error(status: StatusCode, message: &str, kind: &str) -> Response {
     )
         .into_response()
 }
-fn stream_response<S>(stream: S, session: Option<&str>) -> Response
+fn attach_routing_headers(response: &mut Response, session: Option<&SessionRecord>) {
+    let Some(session) = session else { return };
+    if let Ok(value) = HeaderValue::from_str(&session.id) {
+        response.headers_mut().insert("x-workbuddy-session", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&session.project) {
+        response.headers_mut().insert("x-workbuddy-project", value);
+    }
+}
+
+fn stream_response<S>(stream: S, session: Option<&SessionRecord>) -> Response
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, Infallible>> + Send + 'static,
 {
@@ -391,11 +402,7 @@ where
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     h.insert("x-accel-buffering", HeaderValue::from_static("no"));
-    if let Some(id) = session
-        && let Ok(v) = HeaderValue::from_str(id)
-    {
-        h.insert("x-workbuddy-session", v);
-    }
+    attach_routing_headers(&mut response, session);
     response
 }
 
@@ -517,7 +524,7 @@ async fn chat(
             let model2 = model.clone();
             return stream_response(
                 stream! {let mut completed=false;let mut output_bytes=0usize;match first{NormalizedEvent::TextDelta(text)=>{output_bytes=text.len();yield Ok(sse::data(&chat_chunk(&id,&model2,json!({"content":text}),Value::Null)))},NormalizedEvent::Completed=>{completed=true;yield Ok(sse::data(&chat_chunk(&id,&model2,json!({}),json!("stop"))));yield Ok(sse::done());}}while !completed{match events.next().await{Some(Ok(NormalizedEvent::TextDelta(text)))=>{if output_bytes.saturating_add(text.len())>MAX_STREAM_OUTPUT_BYTES{yield Ok(sse::data(&json!({"error":{"message":"WorkBuddy ACP response exceeded the maximum size","type":"proxy_error","code":"upstream_stream_error"}})));break}output_bytes+=text.len();yield Ok(sse::data(&chat_chunk(&id,&model2,json!({"content":text}),Value::Null)))}, Some(Ok(NormalizedEvent::Completed))=>{completed=true;yield Ok(sse::data(&chat_chunk(&id,&model2,json!({}),json!("stop"))));yield Ok(sse::done());},Some(Err(e))=>{yield Ok(sse::data(&json!({"error":{"message":e.to_string(),"type":"proxy_error","code":format!("workbuddy_acp_{}",e.category)}})));break},None=>{yield Ok(sse::data(&json!({"error":{"message":"WorkBuddy ACP ended without completion","type":"proxy_error","code":"upstream_stream_incomplete"}})));break}}}},
-                Some(&session.id),
+                Some(&session),
             );
         }
         let mut stream = match open_acp(&s, &url, &session.project, messages).await {
@@ -537,12 +544,9 @@ async fn chat(
                     }
                 }
                 Ok(NormalizedEvent::Completed) => {
-                    let mut r = Json(openai::chat_result(&model, &text)).into_response();
-                    r.headers_mut().insert(
-                        "x-workbuddy-session",
-                        HeaderValue::from_str(&session.id).unwrap(),
-                    );
-                    return r;
+                    let mut response = Json(openai::chat_result(&model, &text)).into_response();
+                    attach_routing_headers(&mut response, Some(&session));
+                    return response;
                 }
                 Err(e) => return ProxyError::Acp(e).into_response(),
             }
@@ -562,7 +566,7 @@ async fn chat(
         Ok(session) => session,
         Err(error) => return error.into_response(),
     };
-    direct_chat(&s, &headers, body, streaming, Some(&session.id)).await
+    direct_chat(&s, &headers, body, streaming, Some(&session)).await
 }
 fn chat_chunk(id: &str, model: &str, delta: Value, finish: Value) -> Value {
     json!({"id":id,"object":"chat.completion.chunk","created":chrono::Utc::now().timestamp(),"model":model,"choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
@@ -572,7 +576,7 @@ async fn direct_chat(
     headers: &HeaderMap,
     body: Value,
     streaming: bool,
-    session_id: Option<&str>,
+    session: Option<&SessionRecord>,
 ) -> Response {
     let url = format!(
         "{}/chat/completions",
@@ -632,11 +636,7 @@ async fn direct_chat(
         return match serde_json::from_slice::<Value>(&bytes) {
             Ok(value) => {
                 let mut response = Json(value).into_response();
-                if let Some(session_id) = session_id
-                    && let Ok(value) = HeaderValue::from_str(session_id)
-                {
-                    response.headers_mut().insert("x-workbuddy-session", value);
-                }
+                attach_routing_headers(&mut response, session);
                 response
             }
             Err(_) => json_error(
@@ -719,7 +719,7 @@ async fn direct_chat(
                 yield Ok(sse::data(&json!({"error":{"message":"Upstream stream ended without a completion marker","type":"proxy_error","code":"upstream_stream_incomplete"}})));
             }
         },
-        session_id,
+        session,
     )
 }
 
@@ -735,7 +735,10 @@ async fn responses(
         return json_error(StatusCode::BAD_REQUEST, &e, "invalid_request_error");
     }
     let model = openai::normalize_model(body.get("model").and_then(Value::as_str));
-    let chat = openai::build_chat_payload(&body, &model);
+    let chat = match openai::build_chat_payload(&body, &model) {
+        Ok(chat) => chat,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error, "invalid_request_error"),
+    };
     let streaming = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if s.config.transport == "workbuddy_acp" && has_requested_tools(&body) {
         return unsupported_acp_tools();
@@ -770,12 +773,9 @@ async fn responses(
                             &openai::chat_result(&model, &text),
                             &model,
                         );
-                        let mut r = Json(result).into_response();
-                        r.headers_mut().insert(
-                            "x-workbuddy-session",
-                            HeaderValue::from_str(&session.id).unwrap(),
-                        );
-                        return r;
+                        let mut response = Json(result).into_response();
+                        attach_routing_headers(&mut response, Some(&session));
+                        return response;
                     }
                     Err(e) => return ProxyError::Acp(e).into_response(),
                 }
@@ -791,7 +791,7 @@ async fn responses(
             Ok(session) => session,
             Err(error) => return error.into_response(),
         };
-        let response = direct_chat(&s, &headers, chat_non, false, Some(&session.id)).await;
+        let response = direct_chat(&s, &headers, chat_non, false, Some(&session)).await;
         if !response.status().is_success() {
             return response;
         }
@@ -818,9 +818,7 @@ async fn responses(
         };
         let mut response =
             Json(openai::chat_completion_to_response(&value, &model)).into_response();
-        if let Ok(value) = HeaderValue::from_str(&session.id) {
-            response.headers_mut().insert("x-workbuddy-session", value);
-        }
+        attach_routing_headers(&mut response, Some(&session));
         return response;
     }
     if s.config.transport == "workbuddy_acp" {
@@ -838,7 +836,7 @@ async fn responses(
         let model2 = model.clone();
         return stream_response(
             stream! {let mut seq=0;let mut text=String::new();yield Ok(response_event("response.created",&mut seq,json!({"response":openai::base_response(&response_id,&model2,"in_progress",vec![],None)})));yield Ok(response_event("response.output_item.added",&mut seq,json!({"output_index":0,"item":{"id":message_id,"type":"message","status":"in_progress","role":"assistant","content":[]}})));let mut next=Some(Ok(first));let mut done=false;while !done{let e=if let Some(v)=next.take(){Some(v)}else{events.next().await};match e{Some(Ok(NormalizedEvent::TextDelta(v)))=>{if append_stream_output(&mut text,&v).is_err(){let mut failed=openai::base_response(&response_id,&model2,"failed",vec![],None);failed["error"]=json!({"code":"upstream_stream_error","message":"WorkBuddy ACP response exceeded the maximum size"});yield Ok(response_event("response.failed",&mut seq,json!({"response":failed})));done=true;continue;}yield Ok(response_event("response.output_text.delta",&mut seq,json!({"item_id":message_id,"output_index":0,"content_index":0,"delta":v})));},Some(Ok(NormalizedEvent::Completed))=>{let item=openai::message_output_item(&text,Some(&message_id));yield Ok(response_event("response.output_text.done",&mut seq,json!({"item_id":message_id,"output_index":0,"content_index":0,"text":text})));yield Ok(response_event("response.output_item.done",&mut seq,json!({"output_index":0,"item":item})));yield Ok(response_event("response.completed",&mut seq,json!({"response":openai::base_response(&response_id,&model2,"completed",vec![item],None)})));done=true;},Some(Err(e))=>{let mut failed=openai::base_response(&response_id,&model2,"failed",vec![],None);failed["error"]=json!({"code":format!("workbuddy_acp_{}",e.category),"message":e.to_string()});yield Ok(response_event("response.failed",&mut seq,json!({"response":failed})));done=true;},None=>{let mut failed=openai::base_response(&response_id,&model2,"failed",vec![],None);failed["error"]=json!({"code":"upstream_stream_incomplete","message":"WorkBuddy ACP ended without completion"});yield Ok(response_event("response.failed",&mut seq,json!({"response":failed})));done=true;}}}},
-            Some(&session.id),
+            Some(&session),
         );
     }
     let messages = chat["messages"].as_array().cloned().unwrap_or_default();
@@ -846,7 +844,7 @@ async fn responses(
         Ok(session) => session,
         Err(error) => return error.into_response(),
     };
-    direct_responses_stream(&s, &headers, chat, &model, Some(&session.id)).await
+    direct_responses_stream(&s, &headers, chat, &model, Some(&session)).await
 }
 fn response_event(kind: &str, seq: &mut u64, payload: Value) -> bytes::Bytes {
     let mut object = payload.as_object().cloned().unwrap_or_default();
@@ -1089,7 +1087,7 @@ async fn direct_responses_stream(
     headers: &HeaderMap,
     chat: Value,
     model: &str,
-    session_id: Option<&str>,
+    session: Option<&SessionRecord>,
 ) -> Response {
     let url = format!(
         "{}/chat/completions",
@@ -1255,7 +1253,7 @@ async fn direct_responses_stream(
                 }
             }
         },
-        session_id,
+        session,
     )
 }
 

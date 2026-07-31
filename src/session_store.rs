@@ -327,6 +327,27 @@ pub fn validate_history(h: &[Value]) -> Result<(), ProxyError> {
     }
     Ok(())
 }
+fn context_content_identity(content: &Value) -> String {
+    let text = crate::openai::text_from_content(content);
+    let has_non_text = content.as_array().is_some_and(|parts| {
+        parts.iter().any(|part| {
+            !matches!(
+                part.get("type").and_then(Value::as_str),
+                None | Some("text" | "input_text" | "output_text" | "refusal")
+            )
+        })
+    });
+    if !has_non_text {
+        return text;
+    }
+    let mut hash = Sha256::new();
+    hash.update(content.to_string());
+    format!(
+        "{text}[non-text:{}]",
+        &format!("{:x}", hash.finalize())[..16]
+    )
+}
+
 pub fn stable_context_text(messages: &[Value]) -> String {
     let mut out = vec![];
     for m in messages {
@@ -336,7 +357,7 @@ pub fn stable_context_text(messages: &[Value]) -> String {
         }
         out.push(format!(
             "{role}:{}",
-            crate::openai::text_from_content(m.get("content").unwrap_or(&Value::Null))
+            context_content_identity(m.get("content").unwrap_or(&Value::Null))
         ));
         if role == "user" {
             break;

@@ -159,6 +159,13 @@ impl Config {
             .filter(|v| !v.is_empty())
             .map(str::to_string)
             .collect();
+        let default_project = canonical_project_path(&expand_path(
+            &text(
+                "PROXY_DEFAULT_PROJECT",
+                project_root.to_string_lossy().as_ref(),
+            ),
+            &home,
+        ))?;
 
         Ok(Self {
             project_root: project_root.clone(),
@@ -197,13 +204,7 @@ impl Config {
                 ),
                 &home,
             ),
-            default_project: expand_path(
-                &text(
-                    "PROXY_DEFAULT_PROJECT",
-                    project_root.to_string_lossy().as_ref(),
-                ),
-                &home,
-            ),
+            default_project,
             sidecar_startup_timeout: startup,
             sidecar_idle_timeout: idle,
             max_history_turns: max_history,
@@ -290,6 +291,21 @@ fn expand_path(value: &str, home: &Path) -> PathBuf {
     } else {
         PathBuf::from(value)
     }
+}
+fn canonical_project_path(path: &Path) -> Result<PathBuf, ProxyError> {
+    let canonical = fs::canonicalize(path).map_err(|_| {
+        ProxyError::Invalid(format!(
+            "PROXY_DEFAULT_PROJECT directory does not exist: {}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(ProxyError::Invalid(format!(
+            "PROXY_DEFAULT_PROJECT is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
 }
 fn available_models() -> Vec<ModelInfo> {
     ["gpt-5.6-sol", "gpt 5.6 sol", "gpt-4o", "opencode-default"]

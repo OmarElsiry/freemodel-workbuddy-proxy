@@ -85,7 +85,85 @@ pub fn validate_responses_body(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
-pub fn responses_input_to_messages(body: &Value) -> Vec<Value> {
+fn supported_image_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || lower.starts_with("data:image/")
+}
+
+fn unsupported_image_reference() -> String {
+    "Local image paths, file:// URLs, and file_id references are not supported by this proxy. Let Codex read the image with its normal workspace tools, or submit an HTTP(S) or data: image_url.".into()
+}
+
+pub fn chat_content_from_responses(content: &Value) -> Result<Value, String> {
+    match content {
+        Value::Null | Value::String(_) => Ok(content.clone()),
+        Value::Array(parts) => {
+            let mut converted = Vec::with_capacity(parts.len());
+            for part in parts {
+                let Some(object) = part.as_object() else {
+                    return Err("Response message content blocks must be objects".into());
+                };
+                match object.get("type").and_then(Value::as_str) {
+                    Some("text" | "input_text" | "output_text") => {
+                        let text = object
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| "Text content block is missing text".to_string())?;
+                        converted.push(json!({"type":"text","text":text}));
+                    }
+                    Some("input_image") => {
+                        if object.get("file_id").is_some() {
+                            return Err(unsupported_image_reference());
+                        }
+                        let url = object
+                            .get("image_url")
+                            .and_then(Value::as_str)
+                            .ok_or_else(unsupported_image_reference)?;
+                        if !supported_image_url(url) {
+                            return Err(unsupported_image_reference());
+                        }
+                        let mut image = json!({"url":url});
+                        if let Some(detail) = object.get("detail").and_then(Value::as_str) {
+                            image["detail"] = json!(detail);
+                        }
+                        converted.push(json!({"type":"image_url","image_url":image}));
+                    }
+                    Some("image_url") => {
+                        let image = object
+                            .get("image_url")
+                            .and_then(Value::as_object)
+                            .ok_or_else(unsupported_image_reference)?;
+                        let url = image
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .ok_or_else(unsupported_image_reference)?;
+                        if !supported_image_url(url) {
+                            return Err(unsupported_image_reference());
+                        }
+                        converted.push(part.clone());
+                    }
+                    Some("refusal") => {
+                        let refusal = object
+                            .get("refusal")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        converted.push(json!({"type":"text","text":refusal}));
+                    }
+                    Some(other) => {
+                        return Err(format!("Unsupported response content block type: {other}"));
+                    }
+                    None => return Err("Response content block is missing type".into()),
+                }
+            }
+            Ok(Value::Array(converted))
+        }
+        _ => Err("Response message content must be text or an array of content blocks".into()),
+    }
+}
+
+pub fn responses_input_to_messages(body: &Value) -> Result<Vec<Value>, String> {
     let mut messages = Vec::new();
     let object = body.as_object().cloned().unwrap_or_default();
     if let Some(instructions) = object.get("instructions").filter(|v| !v.is_null()) {
@@ -98,7 +176,7 @@ pub fn responses_input_to_messages(body: &Value) -> Vec<Value> {
                 match item {
                 Value::String(text) => messages.push(json!({"role":"user","content":text})),
                 Value::Object(item) => match item.get("type").and_then(Value::as_str).unwrap_or("message") {
-                    "message" => { let mut role = item.get("role").and_then(Value::as_str).unwrap_or("user"); if role == "developer" { role = "system"; } messages.push(json!({"role":role,"content":text_from_content(item.get("content").unwrap_or(&Value::Null))})); },
+                    "message" => { let mut role = item.get("role").and_then(Value::as_str).unwrap_or("user"); if role == "developer" { role = "system"; } messages.push(json!({"role":role,"content":chat_content_from_responses(item.get("content").unwrap_or(&Value::Null))?})); },
                     "function_call" => { let call_id = item.get("call_id").or_else(|| item.get("id")).and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("call_{}", &Uuid::new_v4().simple().to_string()[..16])); let args = item.get("arguments").map(|v| if let Some(s)=v.as_str(){s.into()}else{v.to_string()}).unwrap_or_else(||"{}".into()); messages.push(json!({"role":"assistant","content":"","tool_calls":[{"id":call_id,"type":"function","function":{"name":item.get("name").and_then(Value::as_str).unwrap_or("unknown_tool"),"arguments":args}}]})); },
                     "function_call_output" => messages.push(json!({"role":"tool","tool_call_id":item.get("call_id").and_then(Value::as_str).unwrap_or(""),"content":text_from_content(item.get("output").unwrap_or(&Value::Null))})), _ => {}
                 }, _ => {}
@@ -117,7 +195,7 @@ pub fn responses_input_to_messages(body: &Value) -> Vec<Value> {
     if messages.is_empty() {
         messages.push(json!({"role":"user","content":""}));
     }
-    messages
+    Ok(messages)
 }
 
 pub fn responses_tools_to_chat(tools: Option<&Value>) -> Vec<Value> {
@@ -146,8 +224,8 @@ pub fn responses_tools_to_chat(tools: Option<&Value>) -> Vec<Value> {
         .collect()
 }
 
-pub fn build_chat_payload(body: &Value, model: &str) -> Value {
-    let mut payload = json!({"model":model,"messages":responses_input_to_messages(body),"stream":body.get("stream").and_then(Value::as_bool).unwrap_or(false)});
+pub fn build_chat_payload(body: &Value, model: &str) -> Result<Value, String> {
+    let mut payload = json!({"model":model,"messages":responses_input_to_messages(body)?,"stream":body.get("stream").and_then(Value::as_bool).unwrap_or(false)});
     let tools = responses_tools_to_chat(body.get("tools"));
     if !tools.is_empty() {
         payload["tools"] = Value::Array(tools);
@@ -167,7 +245,7 @@ pub fn build_chat_payload(body: &Value, model: &str) -> Value {
             payload[target] = v.clone();
         }
     }
-    payload
+    Ok(payload)
 }
 
 pub fn chat_result(model: &str, text: &str) -> Value {

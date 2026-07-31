@@ -1,12 +1,14 @@
 use freemodel_workbuddy_proxy::openai::{
-    build_chat_payload, chat_completion_to_response, convert_usage, responses_input_to_messages,
-    responses_tools_to_chat, text_from_content, validate_responses_body,
+    build_chat_payload, chat_completion_to_response, chat_content_from_responses, convert_usage,
+    responses_input_to_messages, responses_tools_to_chat, text_from_content,
+    validate_responses_body,
 };
 use serde_json::json;
 
 #[test]
 fn instructions_and_input_convert_to_chat() {
-    let messages = responses_input_to_messages(&json!({"instructions":"rules","input":"hello"}));
+    let messages =
+        responses_input_to_messages(&json!({"instructions":"rules","input":"hello"})).unwrap();
     assert_eq!(messages[0], json!({"role":"system","content":"rules"}));
     assert_eq!(messages[1], json!({"role":"user","content":"hello"}));
 }
@@ -19,7 +21,8 @@ fn function_definitions_and_calls_translate() {
     let payload = build_chat_payload(
         &json!({"input":[{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"ok"}],"stream":true}),
         "gpt-5.6-sol",
-    );
+    )
+    .unwrap();
     assert_eq!(payload["messages"][0]["tool_calls"][0]["id"], "c1");
     assert_eq!(payload["messages"][1]["role"], "tool");
 }
@@ -68,14 +71,58 @@ fn content_blocks_and_refusals_flatten_in_order() {
 }
 
 #[test]
+fn multimodal_input_preserves_text_and_supported_images_in_order() {
+    let converted = chat_content_from_responses(&json!([
+        {"type":"input_text","text":"before"},
+        {"type":"input_image","image_url":"https://example.test/image.png","detail":"high"},
+        {"type":"input_text","text":"middle"},
+        {"type":"input_image","image_url":"data:image/png;base64,AA=="},
+        {"type":"input_text","text":"after"}
+    ]))
+    .unwrap();
+    assert_eq!(converted[0], json!({"type":"text","text":"before"}));
+    assert_eq!(converted[1]["type"], "image_url");
+    assert_eq!(
+        converted[1]["image_url"]["url"],
+        "https://example.test/image.png"
+    );
+    assert_eq!(converted[1]["image_url"]["detail"], "high");
+    assert_eq!(converted[2], json!({"type":"text","text":"middle"}));
+    assert_eq!(
+        converted[3]["image_url"]["url"],
+        "data:image/png;base64,AA=="
+    );
+    assert_eq!(converted[4], json!({"type":"text","text":"after"}));
+}
+
+#[test]
+fn local_and_malformed_image_references_fail_instead_of_disappearing() {
+    for content in [
+        json!([{"type":"input_image","image_url":"/tmp/image.png"}]),
+        json!([{"type":"input_image","image_url":"file:///tmp/image.png"}]),
+        json!([{"type":"input_image","file_id":"file-123"}]),
+        json!([{"type":"input_image","image_url":"data:text/plain;base64,QQ=="}]),
+        json!([{"type":"input_image"}]),
+        json!([{"type":"unknown","value":"x"}]),
+    ] {
+        let error = chat_content_from_responses(&content).unwrap_err();
+        assert!(!error.is_empty());
+    }
+}
+
+#[test]
 fn developer_role_maps_to_system_and_prompt_fallback_is_preserved() {
     let converted = responses_input_to_messages(&json!({
         "input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]}]
-    }));
-    assert_eq!(converted, vec![json!({"role":"system","content":"rules"})]);
+    }))
+    .unwrap();
+    assert_eq!(
+        converted,
+        vec![json!({"role":"system","content":[{"type":"text","text":"rules"}]})]
+    );
 
     assert_eq!(
-        responses_input_to_messages(&json!({"prompt":"fallback"})),
+        responses_input_to_messages(&json!({"prompt":"fallback"})).unwrap(),
         vec![json!({"role":"user","content":"fallback"})]
     );
 }
@@ -94,7 +141,8 @@ fn payload_forwards_generation_and_tool_controls() {
             "parallel_tool_calls":false
         }),
         "gpt-5.6-sol",
-    );
+    )
+    .unwrap();
     assert_eq!(payload["model"], "gpt-5.6-sol");
     assert_eq!(payload["stream"], true);
     assert_eq!(payload["max_tokens"], 17);
@@ -122,7 +170,8 @@ fn function_call_arguments_and_outputs_preserve_values() {
     let messages = responses_input_to_messages(&json!({"input":[
         {"type":"function_call","call_id":"c1","name":"lookup","arguments":{"q":"你好"}},
         {"type":"function_call_output","call_id":"c1","output":{"answer":42}}
-    ]}));
+    ]}))
+    .unwrap();
     assert_eq!(messages[0]["tool_calls"][0]["id"], "c1");
     assert_eq!(
         messages[0]["tool_calls"][0]["function"]["arguments"],

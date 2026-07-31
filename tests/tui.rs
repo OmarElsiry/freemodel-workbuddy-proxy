@@ -26,7 +26,11 @@ fn launcher_rejects_invalid_arguments_before_build_work() {
     )
     .failure()
     .code(2)
-    .stderr(predicates::str::contains("Usage:").and(predicates::str::contains("[--server-only]")))
+    .stderr(
+        predicates::str::contains("Usage:")
+            .and(predicates::str::contains("--server-only"))
+            .and(predicates::str::contains("--project DIRECTORY")),
+    )
     .stdout(predicates::str::is_empty());
 }
 

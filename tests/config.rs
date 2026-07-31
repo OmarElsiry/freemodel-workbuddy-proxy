@@ -12,6 +12,42 @@ fn defaults_to_public_http_and_loopback() {
     assert_eq!(config.host, "127.0.0.1");
 }
 #[test]
+fn default_project_is_canonical_and_must_be_a_directory() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&project, &alias).unwrap();
+    let env = HashMap::from([
+        ("HOME".into(), root.path().to_string_lossy().to_string()),
+        (
+            "PROXY_DEFAULT_PROJECT".into(),
+            alias.to_string_lossy().to_string(),
+        ),
+    ]);
+    assert_eq!(
+        Config::load_with_env(root.path(), &env)
+            .unwrap()
+            .default_project,
+        std::fs::canonicalize(project).unwrap()
+    );
+
+    for invalid in [root.path().join("missing"), root.path().join("file.txt")] {
+        if invalid.extension().is_some() {
+            std::fs::write(&invalid, "x").unwrap();
+        }
+        let env = HashMap::from([
+            ("HOME".into(), root.path().to_string_lossy().to_string()),
+            (
+                "PROXY_DEFAULT_PROJECT".into(),
+                invalid.to_string_lossy().to_string(),
+            ),
+        ]);
+        assert!(Config::load_with_env(root.path(), &env).is_err());
+    }
+}
+
+#[test]
 fn saved_project_config_precedes_inherited_environment() {
     let dir = tempdir().unwrap();
     std::fs::write(

@@ -69,6 +69,29 @@ async fn automatic_id_stays_stable_when_history_grows_and_is_project_scoped() {
         automatic_session_id(b.to_str().unwrap(), &first).unwrap()
     );
 }
+#[test]
+fn image_only_automatic_sessions_are_stable_and_distinct_without_embedding_data() {
+    let root = tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let a = vec![json!({"role":"user","content":[
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+    ]})];
+    let b = vec![json!({"role":"user","content":[
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,BBBB"}}
+    ]})];
+    let a_id = automatic_session_id(project.to_str().unwrap(), &a).unwrap();
+    assert_eq!(
+        a_id,
+        automatic_session_id(project.to_str().unwrap(), &a).unwrap()
+    );
+    assert_ne!(
+        a_id,
+        automatic_session_id(project.to_str().unwrap(), &b).unwrap()
+    );
+    assert!(!a_id.contains("AAAA"));
+}
+
 #[tokio::test]
 async fn preserves_extra_fields_and_rejects_corrupt_store() {
     let root = tempdir().unwrap();

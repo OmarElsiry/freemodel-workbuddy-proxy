@@ -278,8 +278,14 @@ async fn sidecar_environment_is_minimized() {
         }
     }
 
-    let environment: BTreeMap<String, String> =
+    let captured: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+    let environment: BTreeMap<String, String> =
+        serde_json::from_value(captured["environment"].clone()).unwrap();
+    assert_eq!(
+        captured["current_dir"],
+        serde_json::json!(std::fs::canonicalize(&project).unwrap())
+    );
     assert_eq!(
         environment
             .get("WORKBUDDY_PROXY_SIDECAR")

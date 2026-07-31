@@ -286,6 +286,7 @@ async fn management_rename_clear_history_and_diagnostics() {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(diagnostics["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(diagnostics["build_id"], freemodel_workbuddy_proxy::BUILD_ID);
+    assert_eq!(diagnostics["default_project"], project);
     assert!(diagnostics["uptime_seconds"].as_u64().is_some());
     assert!(diagnostics.get("active_sidecars").is_some());
 }

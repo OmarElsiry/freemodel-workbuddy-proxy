@@ -10,7 +10,11 @@ fn capture_environment() {
         return;
     };
     let environment = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
-    let bytes = serde_json::to_vec(&environment).expect("serialize fake sidecar environment");
+    let capture = serde_json::json!({
+        "environment": environment,
+        "current_dir": std::env::current_dir().expect("read fake sidecar current directory")
+    });
+    let bytes = serde_json::to_vec(&capture).expect("serialize fake sidecar environment");
     let mut output = OpenOptions::new()
         .write(true)
         .truncate(true)
