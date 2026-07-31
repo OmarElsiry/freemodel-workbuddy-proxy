@@ -369,18 +369,8 @@ fn proxy_auth_error() -> Response {
     )
 }
 
-fn auth(headers: &HeaderMap, c: &Config) -> Option<String> {
-    if !c.proxy_api_key.is_empty() {
-        return (!c.api_key.is_empty()).then(|| format!("Bearer {}", c.api_key));
-    }
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|v| !v.is_empty() && !["sk-dummy", "dummy", "placeholder"].contains(v))
-        .map(|v| format!("Bearer {v}"))
-        .or_else(|| (!c.api_key.is_empty()).then(|| format!("Bearer {}", c.api_key)))
+fn auth(_headers: &HeaderMap, c: &Config) -> Option<String> {
+    (!c.api_key.is_empty()).then(|| format!("Bearer {}", c.api_key))
 }
 fn json_error(status: StatusCode, message: &str, kind: &str) -> Response {
     (

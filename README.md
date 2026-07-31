@@ -163,7 +163,7 @@ cargo run --release -- key set
 ## 🔌 Connecting Your Apps (Cursor, Codex, Continue, OpenCode)
 
 - **Base URL on this machine**: `http://127.0.0.1:40589/v1` (use `/v1`, not `/v1/chat/completions`). The launcher prints this URL, and the TUI sidebar and `/diagnostics` command show it while running.
-- **API Key**: leave blank when `PROXY_API_KEY` is blank; otherwise use the exact configured `PROXY_API_KEY` as a Bearer token. The upstream `FREEMODEL_API_KEY` is private to the proxy and should not be copied into clients.
+- **API Key**: use the exact configured `PROXY_API_KEY` when proxy authentication is enabled. When `PROXY_API_KEY` is blank, the local proxy accepts any non-empty client placeholder required by the app and always authenticates upstream with its private configured `FREEMODEL_API_KEY`; the client value is never forwarded to Freemodel. Do not expose the upstream key in client settings.
 - **Supported Models**: `gpt-5.6-sol`, `gpt-4o`, `opencode-default`
 
 Example Codex CLI configuration in `~/.codex/config.toml`:
@@ -179,7 +179,7 @@ env_key = "OPENAI_API_KEY"
 wire_api = "responses"
 ```
 
-Set `OPENAI_API_KEY` to the configured `PROXY_API_KEY`; when proxy authentication is disabled, any non-empty placeholder is sufficient for clients that require a credential variable. This provider configuration was smoke-tested with Codex CLI `0.146.0`. A `429 Credits exhausted` response comes from the logged-in WorkBuddy account, not from local proxy connectivity.
+Set `OPENAI_API_KEY` to the configured `PROXY_API_KEY`. When proxy authentication is disabled, use a non-empty local placeholder such as `local-proxy` if the client requires a credential; the proxy ignores that value for upstream authentication and uses its private `FREEMODEL_API_KEY`. This provider configuration was smoke-tested with Codex CLI `0.146.0`. A `429 Credits exhausted` response comes from the logged-in WorkBuddy account, not from local proxy connectivity.
 
 The default `PROXY_HOST=127.0.0.1` is intentionally available only on the same computer. For another trusted device on your LAN, set both `PROXY_HOST=0.0.0.0` and a strong non-empty `PROXY_API_KEY`, allow TCP port `40589` only on the private firewall zone, and use `http://<this-computer-LAN-IP>:40589/v1`. Do not expose an unauthenticated wildcard bind to a LAN or the public internet.
 

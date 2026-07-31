@@ -165,9 +165,12 @@ async fn recording_upstream() -> (String, RecordedRequest) {
 }
 
 #[tokio::test]
-async fn direct_nonstreaming_forwards_auth_and_converts_responses() {
+async fn direct_nonstreaming_uses_configured_upstream_auth_and_converts_responses() {
     let (base, recorded) = recording_upstream().await;
-    let (_root, state) = direct_state(&base);
+    let (_root, mut state) = direct_state(&base);
+    let mut config = (*state.config).clone();
+    config.api_key = "configured-upstream-key".into();
+    state.config = std::sync::Arc::new(config);
     let app = router(state).layer(MockConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],
         40000,
@@ -190,7 +193,7 @@ async fn direct_nonstreaming_forwards_auth_and_converts_responses() {
     assert_eq!(body["output"][0]["content"][0]["text"], "recorded");
     assert_eq!(
         recorded.authorization.lock().unwrap().as_deref(),
-        Some("Bearer client-key")
+        Some("Bearer configured-upstream-key")
     );
     let upstream = recorded.body.lock().unwrap().clone().unwrap();
     assert_eq!(upstream["model"], "gpt-5.6-sol");
