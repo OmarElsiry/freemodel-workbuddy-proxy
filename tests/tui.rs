@@ -35,7 +35,7 @@ fn launcher_rejects_invalid_arguments_before_build_work() {
 }
 
 #[test]
-fn launcher_always_delegates_freshness_to_cargo() {
+fn launcher_force_rebuild_delegates_to_cargo() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let temp = tempfile::tempdir().unwrap();
     let cargo = temp.path().join("cargo");
@@ -59,7 +59,7 @@ fn launcher_always_delegates_freshness_to_cargo() {
     let output = Command::new("timeout")
         .args(["1s", "bash"])
         .arg(root.join("start.sh"))
-        .arg("--server-only")
+        .args(["--force-rebuild", "--server-only"])
         .current_dir(root)
         .env("PATH", path)
         .env("CARGO_LOG", &log)
@@ -77,6 +77,53 @@ fn launcher_always_delegates_freshness_to_cargo() {
             "build --release --manifest-path {}/Cargo.toml\n",
             root.display()
         )
+    );
+}
+
+#[test]
+fn launcher_reuses_a_current_release_binary_without_cargo() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::create_dir_all(root.path().join("target/release")).unwrap();
+    std::fs::copy(source.join("start.sh"), root.path().join("start.sh")).unwrap();
+    for input in ["Cargo.toml", "Cargo.lock", "build.rs"] {
+        std::fs::write(root.path().join(input), input).unwrap();
+    }
+    std::fs::write(root.path().join("src/lib.rs"), "source").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let binary = root.path().join("target/release/freemodel-workbuddy-proxy");
+    std::fs::write(
+        &binary,
+        "#!/bin/bash\nprintf '%s\\n' \"$*\" > \"$BINARY_LOG\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cargo = root.path().join("cargo");
+    std::fs::write(&cargo, "#!/bin/bash\nexit 99\n").unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let log = root.path().join("binary.log");
+    let path = format!(
+        "{}:{}",
+        root.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("bash")
+        .arg(root.path().join("start.sh"))
+        .args(["--server-only", "--project", "/tmp"])
+        .env("PATH", path)
+        .env("BINARY_LOG", &log)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Using current optimized Rust proxy"));
+    assert_eq!(
+        std::fs::read_to_string(log).unwrap(),
+        "server --project /tmp\n"
     );
 }
 
@@ -127,7 +174,7 @@ fn composer_handles_multiline_unicode_edits() {
     composer.newline();
     composer.insert_str("界🙂");
     assert_eq!(composer.text(), "hello\n界🙂");
-    composer.left();
+    composer.left(false);
     composer.backspace();
     assert_eq!(composer.text(), "hello\n🙂");
 }
@@ -135,27 +182,60 @@ fn composer_handles_multiline_unicode_edits() {
 #[test]
 fn shortcuts_distinguish_send_newline_cancel_and_quit() {
     assert!(matches!(
-        event::key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+        event::key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false, 80),
         Some(freemodel_workbuddy_proxy::tui::app::Action::Submit)
     ));
     assert!(matches!(
-        event::key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), false),
+        event::key_action(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), false, 80),
         Some(freemodel_workbuddy_proxy::tui::app::Action::Newline)
     ));
     assert!(matches!(
         event::key_action(
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            true
+            true,
+            80,
         ),
         Some(freemodel_workbuddy_proxy::tui::app::Action::Cancel)
     ));
     assert!(matches!(
         event::key_action(
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
-            false
+            false,
+            80,
         ),
         Some(freemodel_workbuddy_proxy::tui::app::Action::QuitRequested)
     ));
+}
+
+#[test]
+fn composer_editing_shortcuts_map_to_selection_actions() {
+    use freemodel_workbuddy_proxy::tui::app::Action;
+    for (key, expected) in [
+        ('a', Action::SelectAll),
+        ('c', Action::CopySelection),
+        ('x', Action::CutSelection),
+        ('v', Action::PasteClipboard),
+    ] {
+        assert_eq!(
+            event::key_action(
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                false,
+                80,
+            ),
+            Some(expected)
+        );
+    }
+    assert_eq!(
+        event::key_action(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), false, 80,),
+        Some(Action::Left { select: true })
+    );
+    assert_eq!(
+        event::key_action(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), false, 37,),
+        Some(Action::Up {
+            width: 37,
+            select: false,
+        })
+    );
 }
 
 #[test]
@@ -172,8 +252,8 @@ fn all_documented_shortcuts_have_semantic_actions() {
             Action::Open(Modal::Help),
         ),
         (
-            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
-            Action::Open(Modal::Help),
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            Action::Insert('?'),
         ),
         (
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
@@ -201,9 +281,12 @@ fn all_documented_shortcuts_have_semantic_actions() {
         ),
         (
             KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
-            Action::Home,
+            Action::Home { select: false },
         ),
-        (KeyEvent::new(KeyCode::End, KeyModifiers::NONE), Action::End),
+        (
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+            Action::End { select: false },
+        ),
         (
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
             Action::Backspace,
@@ -214,7 +297,7 @@ fn all_documented_shortcuts_have_semantic_actions() {
         ),
     ];
     for (key, expected) in cases {
-        assert_eq!(event::key_action(key, false), Some(expected));
+        assert_eq!(event::key_action(key, false, 80), Some(expected));
     }
     for (key, command) in [
         ('n', "new"),
@@ -225,6 +308,7 @@ fn all_documented_shortcuts_have_semantic_actions() {
         let action = event::key_action(
             KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
             false,
+            80,
         );
         assert!(matches!(action, Some(Action::Command(ref value)) if value.name == command));
     }
@@ -308,6 +392,6 @@ fn key_release_events_are_ignored() {
         kind: KeyEventKind::Release,
         state: KeyEventState::NONE,
     };
-    assert!(event::key_action(release, false).is_none());
+    assert!(event::key_action(release, false, 80).is_none());
     assert!(event::modal_key_action(release, false).is_none());
 }

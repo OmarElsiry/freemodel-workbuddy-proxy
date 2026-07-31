@@ -162,8 +162,13 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health(State(s): State<AppState>) -> Json<Value> {
+    let upstream_mode = if s.config.transport == "workbuddy_acp" {
+        "official_local_acp"
+    } else {
+        "direct_http"
+    };
     Json(
-        json!({"status":"ok","service":"freemodel-proxy","version":env!("CARGO_PKG_VERSION"),"build_id":crate::BUILD_ID,"uptime_seconds":s.started_at.elapsed().as_secs(),"upstream":s.config.base_url,"transport":s.config.transport}),
+        json!({"status":"ok","service":"freemodel-proxy","version":env!("CARGO_PKG_VERSION"),"build_id":crate::BUILD_ID,"uptime_seconds":s.started_at.elapsed().as_secs(),"logical_service":s.config.base_url,"transport":s.config.transport,"upstream_mode":upstream_mode}),
     )
 }
 async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
@@ -315,6 +320,7 @@ async fn diagnostics(
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_default();
+    let direct = s.config.transport == "http";
     Ok(Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "build_id": crate::BUILD_ID,
@@ -327,6 +333,14 @@ async fn diagnostics(
         "default_project": s.config.default_project,
         "active_sidecars": active_sidecars,
         "max_sidecars": s.config.max_sidecars,
+        "capabilities": {
+            "responses_api": true,
+            "client_function_tools": direct,
+            "skills_execution": if direct { "client" } else { "sidecar_only_not_transparent" },
+            "vision_input": if direct { "http_https_or_data_image_url" } else { "unsupported" },
+            "local_image_paths": false,
+            "image_generation": false
+        },
         "rss_bytes": rss_bytes
     })))
 }

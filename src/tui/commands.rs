@@ -12,7 +12,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "help",
         usage: "/help",
         description: "Open help and command reference",
-        shortcut: Some("F1 / ?"),
+        shortcut: Some("F1 / Ctrl+K"),
         destructive: false,
     },
     CommandSpec {

@@ -193,6 +193,10 @@ async fn health_exposes_current_build_identity() {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(health["service"], "freemodel-proxy");
     assert_eq!(health["build_id"], freemodel_workbuddy_proxy::BUILD_ID);
+    assert_eq!(health["logical_service"], "https://work.freemodel.dev/v1");
+    assert_eq!(health["transport"], "workbuddy_acp");
+    assert_eq!(health["upstream_mode"], "official_local_acp");
+    assert!(health.get("upstream").is_none());
 }
 
 #[tokio::test]
@@ -289,6 +293,15 @@ async fn management_rename_clear_history_and_diagnostics() {
     assert_eq!(diagnostics["default_project"], project);
     assert!(diagnostics["uptime_seconds"].as_u64().is_some());
     assert!(diagnostics.get("active_sidecars").is_some());
+    assert_eq!(diagnostics["capabilities"]["responses_api"], true);
+    assert_eq!(diagnostics["capabilities"]["client_function_tools"], false);
+    assert_eq!(
+        diagnostics["capabilities"]["skills_execution"],
+        "sidecar_only_not_transparent"
+    );
+    assert_eq!(diagnostics["capabilities"]["vision_input"], "unsupported");
+    assert_eq!(diagnostics["capabilities"]["local_image_paths"], false);
+    assert_eq!(diagnostics["capabilities"]["image_generation"], false);
 }
 #[tokio::test]
 async fn management_rename_rejects_empty_title() {

@@ -1,6 +1,6 @@
 use crossterm::{
     cursor::Show,
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -22,7 +22,12 @@ impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut out = io::stdout();
-        if let Err(e) = execute!(out, EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(e) = execute!(
+            out,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             let _ = disable_raw_mode();
             return Err(e);
         }
@@ -39,6 +44,7 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             let _ = execute!(
                 self.terminal.backend_mut(),
+                DisableBracketedPaste,
                 DisableMouseCapture,
                 LeaveAlternateScreen,
                 Show
@@ -59,6 +65,7 @@ fn install_panic_restore(active: Arc<AtomicBool>) {
             let _ = disable_raw_mode();
             let _ = execute!(
                 io::stdout(),
+                DisableBracketedPaste,
                 DisableMouseCapture,
                 LeaveAlternateScreen,
                 Show
@@ -66,6 +73,13 @@ fn install_panic_restore(active: Arc<AtomicBool>) {
         }
         previous(info);
     }));
+}
+
+pub fn sanitize_paste(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| *c == '\n' || *c == '\t' || (!c.is_control() && *c != '\u{1b}'))
+        .collect()
 }
 
 pub fn sanitize(value: &str) -> String {
@@ -84,6 +98,10 @@ pub fn sanitize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paste_sanitization_preserves_layout_and_removes_controls() {
+        assert_eq!(sanitize_paste("a\r\nb\t\u{1b}[2J\u{7}"), "a\nb\t[2J");
+    }
     #[test]
     fn strips_terminal_controls_but_preserves_text_layout() {
         assert_eq!(sanitize("ok\u{1b}[31m\nnext\u{7}"), "ok�[31m\nnext�");

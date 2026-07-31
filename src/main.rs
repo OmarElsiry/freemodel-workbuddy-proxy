@@ -126,7 +126,13 @@ mod tests {
     fn config(root: &std::path::Path) -> Config {
         Config::load_with_env(
             root,
-            &HashMap::from([("HOME".into(), root.to_string_lossy().to_string())]),
+            &HashMap::from([
+                ("HOME".into(), root.to_string_lossy().to_string()),
+                (
+                    "FREEMODEL_BASE_URL".into(),
+                    "https://example.test/v1".into(),
+                ),
+            ]),
         )
         .unwrap()
     }

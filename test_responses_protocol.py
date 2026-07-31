@@ -33,6 +33,7 @@ class ResponsesProtocolTests(unittest.IsolatedAsyncioTestCase):
         ) as app_client:
             with (
                 patch.object(proxy_server.config, "TRANSPORT", "http"),
+                patch.object(proxy_server.config, "DEFAULT_BASE_URL", "https://generic.example/v1"),
                 patch.object(proxy_server.httpx, "AsyncClient", self.client_factory(handler)),
             ):
                 return await app_client.post("/v1/responses", json=payload)

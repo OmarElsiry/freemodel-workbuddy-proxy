@@ -22,14 +22,26 @@ pub struct ProxyClient {
 pub struct Health {
     pub status: String,
     pub service: String,
-    pub upstream: String,
+    #[serde(alias = "upstream")]
+    pub logical_service: String,
     pub transport: String,
+    #[serde(default)]
+    pub upstream_mode: String,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub build_id: String,
     #[serde(default)]
     pub uptime_seconds: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Capabilities {
+    pub responses_api: bool,
+    pub client_function_tools: bool,
+    pub skills_execution: String,
+    pub vision_input: String,
+    pub local_image_paths: bool,
+    pub image_generation: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Diagnostics {
@@ -44,6 +56,7 @@ pub struct Diagnostics {
     pub runtime_dir: String,
     pub active_sidecars: usize,
     pub max_sidecars: usize,
+    pub capabilities: Capabilities,
     pub rss_bytes: Option<u64>,
 }
 #[derive(Clone, Debug)]
@@ -512,8 +525,9 @@ mod tests {
         Health {
             status: "ok".into(),
             service: "freemodel-proxy".into(),
-            upstream: "https://example.invalid/v1".into(),
+            logical_service: "https://example.invalid/v1".into(),
             transport: "http".into(),
+            upstream_mode: "direct_http".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             build_id: build_id.into(),
             uptime_seconds: 1,

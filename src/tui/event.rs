@@ -55,7 +55,7 @@ pub fn modal_key_action(key: KeyEvent, confirm: bool) -> Option<Action> {
     })
 }
 
-pub fn key_action(key: KeyEvent, busy: bool) -> Option<Action> {
+pub fn key_action(key: KeyEvent, busy: bool, composer_width: usize) -> Option<Action> {
     if key.kind == KeyEventKind::Release {
         return None;
     }
@@ -66,13 +66,14 @@ pub fn key_action(key: KeyEvent, busy: bool) -> Option<Action> {
         (KeyCode::Enter, _, true, _) | (KeyCode::Enter, _, _, true) => Action::Newline,
         (KeyCode::Enter, _, _, _) => Action::Submit,
         (KeyCode::Char('c'), true, _, _) if busy => Action::Cancel,
-        (KeyCode::Char('c'), true, _, _) | (KeyCode::Char('q'), true, _, _) => {
-            Action::QuitRequested
-        }
+        (KeyCode::Char('a'), true, _, _) => Action::SelectAll,
+        (KeyCode::Char('c'), true, _, _) => Action::CopySelection,
+        (KeyCode::Char('x'), true, _, _) => Action::CutSelection,
+        (KeyCode::Char('v'), true, _, _) => Action::PasteClipboard,
+        (KeyCode::Char('q'), true, _, _) => Action::QuitRequested,
         (KeyCode::Esc, _, _, _) if busy => Action::Cancel,
         (KeyCode::Esc, _, _, _) => Action::CloseModal,
         (KeyCode::F(1), _, _, _) => Action::Open(Modal::Help),
-        (KeyCode::Char('?'), false, _, _) => Action::Open(Modal::Help),
         (KeyCode::Char('k'), true, _, _) => Action::Open(Modal::Help),
         (KeyCode::Char('n'), true, _, _) => Action::Command(cmd("new")),
         (KeyCode::Char('o'), true, _, _) => Action::Command(cmd("sessions")),
@@ -84,12 +85,18 @@ pub fn key_action(key: KeyEvent, busy: bool) -> Option<Action> {
         (KeyCode::Char('l'), true, _, _) => Action::Notify("Screen redrawn".into()),
         (KeyCode::PageUp, _, _, _) => Action::Scroll(10),
         (KeyCode::PageDown, _, _, _) => Action::Scroll(-10),
-        (KeyCode::Up, _, _, _) => Action::Up,
-        (KeyCode::Down, _, _, _) => Action::Down,
-        (KeyCode::Left, _, _, _) => Action::Left,
-        (KeyCode::Right, _, _, _) => Action::Right,
-        (KeyCode::Home, _, _, _) => Action::Home,
-        (KeyCode::End, _, _, _) => Action::End,
+        (KeyCode::Up, false, _, select) => Action::Up {
+            width: composer_width,
+            select,
+        },
+        (KeyCode::Down, false, _, select) => Action::Down {
+            width: composer_width,
+            select,
+        },
+        (KeyCode::Left, false, _, select) => Action::Left { select },
+        (KeyCode::Right, false, _, select) => Action::Right { select },
+        (KeyCode::Home, false, _, select) => Action::Home { select },
+        (KeyCode::End, false, _, select) => Action::End { select },
         (KeyCode::Backspace, _, _, _) => Action::Backspace,
         (KeyCode::Delete, _, _, _) => Action::Delete,
         (KeyCode::Char(c), false, _, _) => Action::Insert(c),

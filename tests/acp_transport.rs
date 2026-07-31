@@ -58,6 +58,34 @@ fn surfaces_provider_quota_from_refusal_metadata() {
 }
 
 #[test]
+fn classifies_upstream_container_instance_limit_as_actionable_capacity() {
+    let provider = json!({
+        "message": "Failed to start container",
+        "data": {
+            "details": "HTTP 500: Maximum number of running container instances exceeded. Try configuring a higher value for max_instances",
+            "statusCode": 500,
+            "category": "capacity"
+        }
+    });
+    let event = json!({
+        "result": {
+            "stopReason": "refusal",
+            "_meta": {"codebuddy.ai/errorMessage": provider.to_string()}
+        }
+    });
+    let error = prompt_stop_error_for_test(&event, "refusal");
+    assert_eq!(error.category, "capacity");
+    assert_eq!(error.status_code, Some(StatusCode::SERVICE_UNAVAILABLE));
+    assert!(error.retryable);
+    assert!(
+        error
+            .message
+            .contains("WorkBuddy upstream container capacity")
+    );
+    assert!(error.message.contains("not local PROXY_MAX_SIDECARS"));
+}
+
+#[test]
 fn classifies_http_failures() {
     let cases = [
         (StatusCode::FORBIDDEN, "authentication", false),

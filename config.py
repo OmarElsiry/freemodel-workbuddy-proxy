@@ -2,11 +2,12 @@
 
 import os
 import json
+import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
 CONFIG_FILE = Path(__file__).parent / "config.json"
-DEFAULT_PUBLIC_BASE_URL = "https://api.freemodel.dev/v1"
+DEFAULT_WORKBUDDY_BASE_URL = "https://work.freemodel.dev/v1"
 
 
 def load_saved_key() -> str:
@@ -73,7 +74,7 @@ def is_protected_workbuddy_url(base_url: str) -> bool:
 DEFAULT_BASE_URL = (
     os.environ.get("FREEMODEL_BASE_URL")
     or load_saved_base_url()
-    or DEFAULT_PUBLIC_BASE_URL
+    or DEFAULT_WORKBUDDY_BASE_URL
 ).rstrip("/")
 DEFAULT_API_KEY = os.environ.get("FREEMODEL_API_KEY") or load_saved_key()
 
@@ -117,14 +118,14 @@ if WORKBUDDY_ACP_MAX_ATTEMPTS < 1:
     raise ValueError("WORKBUDDY_ACP_MAX_ATTEMPTS must be at least one")
 
 PROJECT_ROOT = Path(__file__).parent
-DEFAULT_CODEBUDDY_CLI = Path(
-    "/home/potterparker/workbuddy-linux/workbuddy-app/resources/app.asar.unpacked/cli/bin/codebuddy"
-)
+_configured_codebuddy = str(
+    os.environ.get("WORKBUDDY_CLI_PATH")
+    or load_saved_value("WORKBUDDY_CLI_PATH", "")
+).strip()
 WORKBUDDY_CLI_PATH = str(
-    Path(
-        os.environ.get("WORKBUDDY_CLI_PATH")
-        or load_saved_value("WORKBUDDY_CLI_PATH", str(DEFAULT_CODEBUDDY_CLI))
-    ).expanduser()
+    Path(_configured_codebuddy).expanduser()
+    if _configured_codebuddy
+    else Path(shutil.which("codebuddy") or "codebuddy")
 )
 PROXY_SESSION_STORE = str(
     Path(

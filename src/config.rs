@@ -11,8 +11,7 @@ use url::Url;
 
 use crate::{error::ProxyError, models::ModelInfo};
 
-pub const DEFAULT_PUBLIC_BASE_URL: &str = "https://api.freemodel.dev/v1";
-pub const DEFAULT_CODEBUDDY_CLI: &str = "/home/potterparker/workbuddy-linux/workbuddy-app/resources/app.asar.unpacked/cli/bin/codebuddy";
+pub const DEFAULT_WORKBUDDY_BASE_URL: &str = "https://work.freemodel.dev/v1";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -64,7 +63,8 @@ impl Config {
             value_text(get(name, Value::String(fallback.into())))
         };
 
-        let base_url = text("FREEMODEL_BASE_URL", DEFAULT_PUBLIC_BASE_URL)
+        let base_url = text("FREEMODEL_BASE_URL", DEFAULT_WORKBUDDY_BASE_URL)
+            .trim()
             .trim_end_matches('/')
             .to_string();
         let protected = is_protected_workbuddy_url(&base_url)?;
@@ -124,7 +124,7 @@ impl Config {
             "PROXY_MAX_HISTORY_TURNS",
         )?;
         let max_sidecars = parse_usize(
-            get("PROXY_MAX_SIDECARS", Value::from(8)),
+            get("PROXY_MAX_SIDECARS", Value::from(16)),
             "PROXY_MAX_SIDECARS",
         )?;
         if !startup.is_finite()
@@ -166,6 +166,13 @@ impl Config {
             ),
             &home,
         ))?;
+        let configured_cli = text("WORKBUDDY_CLI_PATH", "");
+        let workbuddy_cli_path = if configured_cli.trim().is_empty() {
+            find_executable_on_path("codebuddy", environment.get("PATH").map(String::as_str))
+                .unwrap_or_else(|| PathBuf::from("codebuddy"))
+        } else {
+            expand_path(configured_cli.trim(), &home)
+        };
 
         Ok(Self {
             project_root: project_root.clone(),
@@ -180,10 +187,7 @@ impl Config {
             workbuddy_acp_cwd: acp_cwd,
             workbuddy_acp_timeout: acp_timeout,
             workbuddy_acp_max_attempts: attempts,
-            workbuddy_cli_path: expand_path(
-                &text("WORKBUDDY_CLI_PATH", DEFAULT_CODEBUDDY_CLI),
-                &home,
-            ),
+            workbuddy_cli_path,
             session_store: expand_path(
                 &text(
                     "PROXY_SESSION_STORE",
@@ -291,6 +295,16 @@ fn expand_path(value: &str, home: &Path) -> PathBuf {
     } else {
         PathBuf::from(value)
     }
+}
+fn find_executable_on_path(name: &str, path: Option<&str>) -> Option<PathBuf> {
+    env::split_paths(path?)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
 }
 fn canonical_project_path(path: &Path) -> Result<PathBuf, ProxyError> {
     let canonical = fs::canonicalize(path).map_err(|_| {

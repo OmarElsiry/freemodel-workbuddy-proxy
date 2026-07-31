@@ -56,6 +56,8 @@ async fn missing_cli_fails_without_sidecar_metadata_or_runtime_artifacts() {
     );
     let error = manager.ensure(&session).await.unwrap_err().to_string();
     assert!(error.contains("Official CodeBuddy CLI was not found"));
+    assert!(error.contains("WORKBUDDY_CLI_PATH"));
+    assert!(error.contains("PATH"));
     assert!(
         store
             .get(&session.id)
@@ -186,7 +188,8 @@ async fn max_sidecars_blocks_a_second_active_session() {
     );
     manager.ensure(&first).await.unwrap();
     let error = manager.ensure(&second).await.unwrap_err().to_string();
-    assert!(error.contains("Maximum active proxy sidecars reached"));
+    assert!(error.contains("Maximum active local proxy sidecars reached"));
+    assert!(error.contains("does not control WorkBuddy upstream max_instances"));
     manager.stop_all().await;
 }
 

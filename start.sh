@@ -12,31 +12,62 @@ if [[ -f "$DIR/config.json" ]]; then
     unset FREEMODEL_API_KEY FREEMODEL_BASE_URL FREEMODEL_TRANSPORT WORKBUDDY_ACP_URL WORKBUDDY_ACP_PASSWORD
 fi
 
-SERVER_ARGS=()
-case "$#:${1:-}" in
-    0:)
-        MODE="tui"
-        ;;
-    1:--server-only)
-        MODE="server"
-        ;;
-    3:--server-only)
-        if [[ "${2:-}" != "--project" || -z "${3:-}" ]]; then
-            echo "Usage: $0 [--server-only [--project DIRECTORY]]" >&2
+MODE="tui"
+PROJECT=""
+FORCE_REBUILD="${PROXY_FORCE_REBUILD:-0}"
+while (($#)); do
+    case "$1" in
+        --server-only)
+            MODE="server"
+            shift
+            ;;
+        --project)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "--project requires a directory" >&2
+                exit 2
+            fi
+            PROJECT="$2"
+            shift 2
+            ;;
+        --force-rebuild)
+            FORCE_REBUILD=1
+            shift
+            ;;
+        *)
+            echo "Usage: $0 [--force-rebuild] [--server-only [--project DIRECTORY]]" >&2
             exit 2
+            ;;
+    esac
+done
+if [[ -n "$PROJECT" && "$MODE" != "server" ]]; then
+    echo "--project requires --server-only" >&2
+    exit 2
+fi
+
+needs_build=false
+if [[ "$FORCE_REBUILD" == "1" || ! -x "$BINARY" ]]; then
+    needs_build=true
+else
+    for input in "$DIR/Cargo.toml" "$DIR/Cargo.lock" "$DIR/build.rs"; do
+        if [[ -e "$input" && "$input" -nt "$BINARY" ]]; then
+            needs_build=true
+            break
         fi
-        MODE="server"
-        SERVER_ARGS=(--project "$3")
-        ;;
-    *)
-        echo "Usage: $0 [--server-only [--project DIRECTORY]]" >&2
-        exit 2
-        ;;
-esac
+    done
+    if [[ "$needs_build" == false && -n "$(find "$DIR/src" -type f -newer "$BINARY" -print -quit 2>/dev/null)" ]]; then
+        needs_build=true
+    fi
+fi
 
-# Always ask Cargo to build. Cargo performs a fast no-op when the binary is
-# current and recompiles it whenever source files or manifests have changed.
-echo "Ensuring optimized Rust proxy is current..."
-cargo build --release --manifest-path "$DIR/Cargo.toml"
+if [[ "$needs_build" == true ]]; then
+    echo "Building optimized Rust proxy (source changed or rebuild requested)..."
+    cargo build --release --manifest-path "$DIR/Cargo.toml"
+else
+    echo "Using current optimized Rust proxy (pass --force-rebuild to rebuild)."
+fi
 
+SERVER_ARGS=()
+if [[ -n "$PROJECT" ]]; then
+    SERVER_ARGS=(--project "$PROJECT")
+fi
 exec "$BINARY" "$MODE" "${SERVER_ARGS[@]}"

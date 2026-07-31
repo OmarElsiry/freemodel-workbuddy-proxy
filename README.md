@@ -25,10 +25,10 @@ A high-performance, OpenAI-compatible proxy server and Terminal User Interface (
 
 The proxy supports two transports:
 
-- `http`: Direct OpenAI-compatible HTTP, used by the public Freemodel endpoint and other generic upstreams.
-- `workbuddy_acp`: Official WorkBuddy ACP, required for the protected `https://work.freemodel.dev/v1` endpoint. Startup fails if this host is paired with `http` transport.
+- `workbuddy_acp` (default): Official WorkBuddy ACP for the logical WorkBuddy service at `https://work.freemodel.dev/v1`. The OpenAI-style service route is `https://work.freemodel.dev/v1/chat/completions`, but the proxy deliberately does **not** POST to that protected URL. It launches or discovers an authenticated local CodeBuddy ACP gateway and exchanges ACP messages through loopback `/api/v1/acp`.
+- `http`: Direct OpenAI-compatible HTTP only when you explicitly configure another upstream. Do not use this transport with `work.freemodel.dev`.
 
-Example ignored local `config.json`:
+The default configuration is equivalent to:
 
 ```json
 {
@@ -37,11 +37,13 @@ Example ignored local `config.json`:
 }
 ```
 
-For the protected endpoint, the proxy launches the bundled official CodeBuddy CLI as a dedicated local gateway for each active proxy session. This prevents proxy traffic from being attached to the WorkBuddy GUI gateway and conversation. WorkBuddy account access must already be available to the official CLI; never copy or imitate private HTTP authentication.
+You may place those values in the ignored local `config.json`, but they do not need to be repeated. For a deliberate generic HTTP upstream, configure its base URL (normally ending in `/v1`, without `/chat/completions`) and set `FREEMODEL_TRANSPORT` to `http`; the proxy appends `/chat/completions` only on that direct-HTTP path.
+
+For the default protected service, the proxy launches the official CodeBuddy CLI as a dedicated local gateway for each active proxy session. This prevents proxy traffic from being attached to the WorkBuddy GUI gateway and conversation. WorkBuddy account access must already be available to the official CLI; never copy or imitate private HTTP authentication.
 
 Optional ACP settings are `WORKBUDDY_ACP_TIMEOUT` and `WORKBUDDY_ACP_MAX_ATTEMPTS`. Session-isolation settings are:
 
-- `WORKBUDDY_CLI_PATH`: path to the official bundled `codebuddy` executable.
+- `WORKBUDDY_CLI_PATH`: optional path to the official `codebuddy` executable. If omitted, the proxy resolves `codebuddy` from `PATH`; no machine-specific path is compiled in.
 - `PROXY_DEFAULT_PROJECT`: fallback project for clients that cannot send a project header.
 - `PROXY_SESSION_STORE`: proxy-owned JSON metadata and TUI history store.
 - `PROXY_RUNTIME_DIR`: sidecar logs and runtime files.
@@ -81,7 +83,7 @@ Running `./start.sh` opens the Rust hybrid TUI:
 7. opens a full-screen, resize-safe chat workspace with wrapped multiline transcripts, multiline input, validated streaming, cancellation, retry/edit-resend, transcript search, model and project selection, diagnostics, a bounded sanitized proxy-log view, and persisted non-secret preferences;
 8. uses full-transcript replacement after retry/edit so corrected turns replace saved history rather than duplicating old turns.
 
-Press `F1` or type `/help` for all shortcuts and commands. Common actions include `Ctrl+O` session picker, `Ctrl+P` project switch, `Ctrl+M` model picker, `Ctrl+R` retry, `Ctrl+E` edit/resend, `Esc` cancel/close, and `Ctrl+Q` safe exit. Session commands include `/new`, `/sessions`, `/switch`, `/rename`, `/clear`, and `/delete`; destructive commands require confirmation.
+Press `F1`, `Ctrl+K`, or type `/help` for all shortcuts and commands. The composer supports normal text editing with Left/Right, selection with Shift+Arrow or `Ctrl+A`, and `Ctrl+C`/`Ctrl+X`/`Ctrl+V` for selected input. The `?` character is regular input. Up/Down moves between multiline or wrapped rows first, then browses sent-prompt history while preserving the current draft. Common actions include `Ctrl+O` session picker, `Ctrl+P` project switch, `Ctrl+M` model picker, `Ctrl+R` retry, `Ctrl+E` edit/resend, `Esc` cancel/close, and `Ctrl+Q` safe exit. Session commands include `/new`, `/sessions`, `/switch`, `/rename`, `/clear`, and `/delete`; destructive commands require confirmation.
 
 Sidecar processes are temporary. The first request for a session can take up to the configured `PROXY_SIDECAR_STARTUP_TIMEOUT` (90 seconds by default) while the official CLI initializes; later requests reuse the healthy sidecar. An idle sidecar is stopped after `PROXY_SIDECAR_IDLE_TIMEOUT`, while the session title, project, and history stay available. Selecting or addressing that session again starts a new sidecar automatically. The proxy writes session metadata and sidecar log files with owner-only permissions (`0600`), keeps runtime directories private (`0700`), and launches each sidecar with a minimized environment that excludes proxy credentials, provider API keys, gateway passwords, and dynamic-loader injection variables.
 
@@ -196,6 +198,21 @@ The proxy deliberately does **not** scan, enumerate, or upload the project direc
 For vision input, direct HTTP accepts OpenAI Responses `input_image` blocks whose `image_url` is HTTP(S) or a `data:image/...` URL and converts them without dereferencing the URL. Existing Chat Completions `image_url` blocks are preserved. Bare local paths, `file://` URLs, and `file_id` references return an explicit `400` instead of being silently discarded: let Codex use its normal image/file tool to read the workspace image, or submit encoded image content. The proxy never opens or base64-encodes local images automatically.
 
 The protected WorkBuddy ACP transport remains project-scoped—its sidecar and ACP session use the canonical project as their working directory—but client-supplied function tools are not supported by that transport. Use the direct HTTP transport for the complete Codex Responses tool loop and encoded vision inputs.
+
+### Skills, tools, and images compatibility
+
+| Capability | Direct HTTP (`http`) | WorkBuddy ACP (`workbuddy_acp`) |
+| --- | --- | --- |
+| `/v1/responses` text | Yes | Yes |
+| Client function-tool loop | Yes | No; rejected explicitly |
+| Codex/WorkBuddy skills | Executed by the client through its function-tool loop; the proxy transports calls and results | Sidecar-internal skills may be available, but they are not exposed as a transparent client tool loop |
+| Vision/image input | HTTP(S) and `data:image/...` URLs | Not supported through the ACP text transport |
+| Bare local image paths | No; the client must read/encode them | No |
+| Image generation | No image-generation endpoint or output-event translation | No |
+
+A skill is not installed or executed by the proxy itself. Codex or WorkBuddy owns skill discovery, permissions, and execution; the direct transport preserves the Responses function calls needed for that workflow. Image understanding (vision input) must not be confused with image generation, which this proxy does not implement.
+
+`PROXY_MAX_SIDECARS` controls only proxy-owned local CodeBuddy gateway processes and defaults to `16`. Increase it only if the machine has sufficient memory and file descriptors. It does **not** control the WorkBuddy service's agent/container `max_instances` quota. An upstream "Maximum number of running container instances exceeded" response must be resolved by freeing/waiting for upstream instances or changing the official service/account configuration; changing `PROXY_MAX_SIDECARS` cannot raise that quota.
 
 The default `PROXY_HOST=127.0.0.1` is intentionally available only on the same computer. For another trusted device on your LAN, set both `PROXY_HOST=0.0.0.0` and a strong non-empty `PROXY_API_KEY`, allow TCP port `40589` only on the private firewall zone, and use `http://<this-computer-LAN-IP>:40589/v1`. Do not expose an unauthenticated wildcard bind to a LAN or the public internet.
 

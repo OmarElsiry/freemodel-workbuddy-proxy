@@ -52,9 +52,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         render_modal(frame, app, modal, centered(area, 75, 75));
     }
 }
+pub fn composer_width(terminal_width: u16) -> usize {
+    usize::from(terminal_width.saturating_sub(2).max(1))
+}
 fn composer_height(app: &App, width: u16) -> u16 {
-    let lines = app.composer.text().lines().count().max(1) as u16;
-    lines.min(5).saturating_add(2).min(width.max(1))
+    let lines = app.composer.visual_row_count(composer_width(width)) as u16;
+    lines.min(5).saturating_add(2)
 }
 fn colors(app: &App) -> (Color, Color, Color) {
     if app.no_color {
@@ -260,6 +263,55 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         area,
     );
 }
+fn composer_text(app: &App) -> Text<'static> {
+    let selected = app.composer.selection_range();
+    let mut lines = vec![Vec::new()];
+    let mut chunk = String::new();
+    let mut chunk_selected = false;
+    for (index, c) in app.composer.text().chars().enumerate() {
+        let is_selected = selected
+            .as_ref()
+            .is_some_and(|range| range.contains(&index));
+        if c == '\n' {
+            if !chunk.is_empty() {
+                let style = if chunk_selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default()
+                };
+                lines
+                    .last_mut()
+                    .unwrap()
+                    .push(Span::styled(std::mem::take(&mut chunk), style));
+            }
+            lines.push(Vec::new());
+            chunk_selected = false;
+            continue;
+        }
+        if !chunk.is_empty() && chunk_selected != is_selected {
+            let style = if chunk_selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            lines
+                .last_mut()
+                .unwrap()
+                .push(Span::styled(std::mem::take(&mut chunk), style));
+        }
+        chunk_selected = is_selected;
+        chunk.push(c);
+    }
+    if !chunk.is_empty() {
+        let style = if chunk_selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        lines.last_mut().unwrap().push(Span::styled(chunk, style));
+    }
+    Text::from(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+}
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let (c, _, warn) = colors(app);
     let busy = app.busy();
@@ -269,13 +321,21 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
         " Composer · Enter send · Alt/Shift+Enter newline "
     };
     frame.render_widget(
-        Paragraph::new(sanitize(&app.composer.text()))
+        Paragraph::new(composer_text(app))
             .block(
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(if busy { warn } else { c })),
             )
+            .scroll((
+                app.composer
+                    .cursor_screen_position(composer_width(area.width))
+                    .0
+                    .saturating_sub(usize::from(area.height.saturating_sub(3)))
+                    as u16,
+                0,
+            ))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -287,9 +347,10 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
         let (row, col) = app
             .composer
             .cursor_screen_position(inner.width.max(1) as usize);
+        let scroll = row.saturating_sub(usize::from(inner.height.saturating_sub(1)));
         frame.set_cursor_position((
             inner.x + (col as u16).min(inner.width.saturating_sub(1)),
-            inner.y + (row as u16).min(inner.height.saturating_sub(1)),
+            inner.y + (row.saturating_sub(scroll) as u16).min(inner.height.saturating_sub(1)),
         ));
     }
 }
@@ -312,18 +373,21 @@ fn render_modal(frame: &mut Frame, app: &App, modal: &Modal, area: Rect) {
     let (title, text, border) = match modal {
         Modal::Help => (
             "Help & commands",
-            COMMANDS
-                .iter()
-                .map(|v| {
-                    format!(
-                        "{:<24} {}{}",
-                        v.usage,
-                        v.description,
-                        v.shortcut.map(|s| format!("  [{s}]")).unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
+            format!(
+                "Composer editing\nCtrl+A select all · Shift+Arrow select · Ctrl+C/X/V copy/cut/paste\nLeft/Right move cursor · Up/Down move by row, then browse prompt history\nEnter sends · Alt/Shift+Enter inserts newline · Esc cancels · Ctrl+Q quits\n\n{}",
+                COMMANDS
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            "{:<24} {}{}",
+                            v.usage,
+                            v.description,
+                            v.shortcut.map(|s| format!("  [{s}]")).unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
             c,
         ),
         Modal::Diagnostics => (

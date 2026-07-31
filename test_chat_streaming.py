@@ -33,6 +33,7 @@ class ChatStreamingTests(unittest.IsolatedAsyncioTestCase):
         ) as client:
             with (
                 patch.object(proxy_server.config, "TRANSPORT", transport),
+                patch.object(proxy_server.config, "DEFAULT_BASE_URL", "https://generic.example/v1"),
                 patch.object(proxy_server.httpx, "AsyncClient", self.client_factory(handler)),
             ):
                 return await client.post("/v1/chat/completions", json=payload)

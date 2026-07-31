@@ -13,40 +13,31 @@ CONFIG_PATH = Path(__file__).with_name("config.py")
 
 
 def load_config(config_file: Path, environment: dict[str, str] | None = None):
-    spec = importlib.util.spec_from_file_location("config_under_test", CONFIG_PATH)
+    """Import config.py beside an isolated test config.json.
+
+    config.py intentionally resolves its project configuration relative to its own
+    location at import time. Loading a temporary copy exercises that real behavior
+    without allowing the developer's ignored local config.json to leak into tests.
+    """
+    isolated_module_path = config_file.with_name("config_under_test.py")
+    isolated_module_path.write_text(CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("config_under_test", isolated_module_path)
     module = importlib.util.module_from_spec(spec)
     with patch.dict(os.environ, environment or {}, clear=True):
         with patch.object(Path, "home", return_value=config_file.parent / "home"):
             spec.loader.exec_module(module)
-    module.CONFIG_FILE = config_file
-    with patch.dict(os.environ, environment or {}, clear=True):
-        module.DEFAULT_BASE_URL = (
-            os.environ.get("FREEMODEL_BASE_URL")
-            or module.load_saved_base_url()
-            or module.DEFAULT_PUBLIC_BASE_URL
-        ).rstrip("/")
-        module.DEFAULT_API_KEY = os.environ.get("FREEMODEL_API_KEY") or module.load_saved_key()
-        module.TRANSPORT = str(
-            os.environ.get("FREEMODEL_TRANSPORT")
-            or module.load_saved_value(
-                "FREEMODEL_TRANSPORT",
-                "workbuddy_acp"
-                if module.is_protected_workbuddy_url(module.DEFAULT_BASE_URL)
-                else "http",
-            )
-        ).strip().lower()
-        if module.is_protected_workbuddy_url(module.DEFAULT_BASE_URL) and module.TRANSPORT != "workbuddy_acp":
-            raise ValueError("https://work.freemodel.dev requires FREEMODEL_TRANSPORT=workbuddy_acp")
     return module
 
 
 class ConfigTests(unittest.TestCase):
-    def test_defaults_to_public_endpoint(self):
+    def test_defaults_to_workbuddy_service_over_official_acp(self):
         with tempfile.TemporaryDirectory() as directory:
             config_file = Path(directory) / "config.json"
             config = load_config(config_file)
 
-        self.assertEqual(config.DEFAULT_BASE_URL, "https://api.freemodel.dev/v1")
+        self.assertEqual(config.DEFAULT_BASE_URL, "https://work.freemodel.dev/v1")
+        self.assertEqual(config.TRANSPORT, "workbuddy_acp")
+        self.assertEqual(config.WORKBUDDY_CLI_PATH, "codebuddy")
 
     def test_reads_saved_base_url_and_strips_trailing_slash(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,7 +85,7 @@ class ConfigTests(unittest.TestCase):
             config_file.write_text(
                 json.dumps(
                     {
-                        "FREEMODEL_BASE_URL": "https://api.freemodel.dev/v1",
+                        "FREEMODEL_BASE_URL": "https://generic.example/v1",
                         "FREEMODEL_TRANSPORT": "workbuddy_acp",
                     }
                 ),
@@ -103,7 +94,7 @@ class ConfigTests(unittest.TestCase):
             config = load_config(
                 config_file,
                 {
-                    "FREEMODEL_BASE_URL": "https://api.freemodel.dev/v1",
+                    "FREEMODEL_BASE_URL": "https://generic.example/v1",
                     "FREEMODEL_TRANSPORT": "http",
                 },
             )
@@ -131,6 +122,26 @@ class ConfigTests(unittest.TestCase):
             )
 
         self.assertEqual(config.TRANSPORT, "http")
+
+    def test_codebuddy_cli_uses_explicit_path_or_path_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            discovered = bin_dir / "codebuddy"
+            discovered.write_text("#!/bin/sh\n", encoding="utf-8")
+            discovered.chmod(0o700)
+            config = load_config(root / "config.json", {"PATH": str(bin_dir)})
+            self.assertEqual(config.WORKBUDDY_CLI_PATH, str(discovered))
+
+            explicit = root / "custom-codebuddy"
+            config = load_config(
+                root / "config.json",
+                {"PATH": str(bin_dir), "WORKBUDDY_CLI_PATH": str(explicit)},
+            )
+            self.assertEqual(config.WORKBUDDY_CLI_PATH, str(explicit))
+
+        self.assertNotIn("/home/potterparker/", CONFIG_PATH.read_text(encoding="utf-8"))
 
     def test_reads_key_without_exposing_it_in_source(self):
         with tempfile.TemporaryDirectory() as directory:

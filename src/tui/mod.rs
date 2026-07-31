@@ -78,7 +78,22 @@ pub async fn run(config: &crate::config::Config) -> Result<()> {
                         .into_iter()
                         .collect()
                 } else {
-                    event::key_action(key, app.busy()).into_iter().collect()
+                    let width = terminal
+                        .terminal_mut()
+                        .size()
+                        .map(|area| view::composer_width(area.width))
+                        .unwrap_or(1);
+                    event::key_action(key, app.busy(), width)
+                        .into_iter()
+                        .collect()
+                }
+            }
+            UiEvent::Input(CrosstermEvent::Paste(text)) => {
+                let text = terminal::sanitize_paste(&text);
+                if app.modal.is_some() {
+                    text.chars().map(Action::ModalInput).collect()
+                } else {
+                    vec![Action::InsertText(text)]
                 }
             }
             UiEvent::Input(CrosstermEvent::Mouse(mouse)) => {
@@ -308,7 +323,7 @@ async fn execute_effect(
         Effect::LoadDiagnostics => match client.diagnostics().await {
             Ok(value) => {
                 app.update(Action::DiagnosticsLoaded(format!(
-                    "Version: {}\nUptime: {}s\nBase URL: {}/v1\nBind: {}\nTransport: {}\nUpstream: {}\nSession store: {}\nRuntime: {}\nSidecars: {}/{}\nRSS: {}",
+                    "Version: {}\nUptime: {}s\nBase URL: {}/v1\nBind: {}\nTransport: {}\nUpstream: {}\nSession store: {}\nRuntime: {}\nSidecars: {}/{}\nResponses API: {}\nClient function tools: {}\nSkills execution: {}\nVision input: {}\nLocal image paths: {}\nImage generation: {}\nRSS: {}",
                     value.version,
                     value.uptime_seconds,
                     value.bind_url,
@@ -319,6 +334,12 @@ async fn execute_effect(
                     value.runtime_dir,
                     value.active_sidecars,
                     value.max_sidecars,
+                    value.capabilities.responses_api,
+                    value.capabilities.client_function_tools,
+                    value.capabilities.skills_execution,
+                    value.capabilities.vision_input,
+                    value.capabilities.local_image_paths,
+                    value.capabilities.image_generation,
                     value
                         .rss_bytes
                         .map(|v| format!("{:.1} MiB", v as f64 / 1_048_576.0))
@@ -413,6 +434,35 @@ async fn execute_effect(
                     app.modal = Some(Modal::Error(
                         "Clipboard is unavailable in this terminal".into(),
                     ))
+                }
+            }
+        }
+        Effect::WriteClipboard { text, cut } => {
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+                Ok(()) => {
+                    if cut {
+                        app.update(Action::CutCommitted);
+                        app.update(Action::Notify("Cut selection to clipboard".into()));
+                    } else {
+                        app.update(Action::Notify("Copied selection to clipboard".into()));
+                    }
+                }
+                Err(_) => {
+                    app.update(Action::Notify(
+                        "Clipboard is unavailable in this terminal".into(),
+                    ));
+                }
+            }
+        }
+        Effect::ReadClipboard => {
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                Ok(text) => {
+                    app.update(Action::InsertText(terminal::sanitize_paste(&text)));
+                }
+                Err(_) => {
+                    app.update(Action::Notify(
+                        "Clipboard is unavailable in this terminal".into(),
+                    ));
                 }
             }
         }

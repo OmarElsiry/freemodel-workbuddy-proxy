@@ -235,18 +235,41 @@ impl AcpTransport {
                                 .and_then(Value::as_str)
                                 .unwrap_or("WorkBuddy ACP JSON-RPC error");
                             let lower = message.to_lowercase();
-                            return Err(AcpError::new(message, "upstream").retryable(
-                                [
-                                    "timeout",
-                                    "temporarily",
-                                    "capacity",
-                                    "refusal",
-                                    "network",
-                                    "interrupted",
-                                ]
-                                .iter()
-                                .any(|m| lower.contains(m)),
-                            ));
+                            let upstream_instance_limit = lower
+                                .contains("maximum number of running container instances exceeded")
+                                || lower.contains("max_instances");
+                            let message = if upstream_instance_limit {
+                                format!(
+                                    "WorkBuddy upstream container capacity is exhausted: {message} This quota is controlled by the WorkBuddy service/account, not local PROXY_MAX_SIDECARS. Wait for an upstream instance to finish or change the official WorkBuddy max_instances configuration."
+                                )
+                            } else {
+                                message.to_string()
+                            };
+                            let mut error = AcpError::new(
+                                message,
+                                if upstream_instance_limit {
+                                    "capacity"
+                                } else {
+                                    "upstream"
+                                },
+                            )
+                            .retryable(
+                                upstream_instance_limit
+                                    || [
+                                        "timeout",
+                                        "temporarily",
+                                        "capacity",
+                                        "refusal",
+                                        "network",
+                                        "interrupted",
+                                    ]
+                                    .iter()
+                                    .any(|m| lower.contains(m)),
+                            );
+                            if upstream_instance_limit {
+                                error = error.status(StatusCode::SERVICE_UNAVAILABLE);
+                            }
+                            return Err(error);
                         }
                         found = true;
                     }
@@ -373,21 +396,39 @@ fn prompt_stop_error(event: &Value, reason: &str) -> AcpError {
         _ if reason == "refusal" => "refusal",
         _ => "upstream",
     };
+    let upstream_instance_limit = detail
+        .to_ascii_lowercase()
+        .contains("maximum number of running container instances exceeded")
+        || detail.to_ascii_lowercase().contains("max_instances");
     let mut error = AcpError::new(
-        if detail.is_empty() {
+        if upstream_instance_limit {
+            format!(
+                "WorkBuddy upstream container capacity is exhausted: {detail} This quota is controlled by the WorkBuddy service/account, not local PROXY_MAX_SIDECARS. Wait for an upstream instance to finish or change the official WorkBuddy max_instances configuration."
+            )
+        } else if detail.is_empty() {
             fallback
         } else {
             format!("WorkBuddy model request failed: {detail}")
         },
-        category,
+        if upstream_instance_limit {
+            "capacity"
+        } else {
+            category
+        },
     );
-    if let Some(status) = status {
+    if upstream_instance_limit {
+        error = error.status(StatusCode::SERVICE_UNAVAILABLE);
+    } else if let Some(status) = status {
         error = error.status(status);
     }
-    error.retryable(
-        matches!(status.map(|value| value.as_u16()), Some(408 | 409 | 425))
-            || status.is_some_and(|value| value.is_server_error()),
-    )
+    let retryable = upstream_instance_limit
+        || (provider_category != "quota"
+            && category != "authentication"
+            && (matches!(
+                status.map(|value| value.as_u16()),
+                Some(408 | 409 | 425 | 429)
+            ) || status.is_some_and(|value| value.is_server_error())));
+    error.retryable(retryable)
 }
 
 #[doc(hidden)]

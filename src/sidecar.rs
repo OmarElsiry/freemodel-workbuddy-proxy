@@ -65,8 +65,30 @@ impl SidecarManager {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
+    async fn reconcile_exited(&self) -> Result<(), ProxyError> {
+        let exited = {
+            let mut processes = self.processes.lock();
+            let exited: Vec<_> = processes
+                .iter_mut()
+                .filter_map(|(id, managed)| {
+                    managed.child.try_wait().ok().flatten().map(|_| id.clone())
+                })
+                .collect();
+            for id in &exited {
+                processes.remove(id);
+            }
+            exited
+        };
+        for id in exited {
+            self.last.lock().remove(&id);
+            let _ = self.store.clear_sidecar(&id).await;
+        }
+        Ok(())
+    }
+
     pub async fn ensure(&self, session: &SessionRecord) -> Result<String, ProxyError> {
         let guard = self.lock(&session.id).lock_owned().await;
+        self.reconcile_exited().await?;
         let current = self
             .store
             .get(&session.id)
@@ -84,13 +106,16 @@ impl SidecarManager {
         }
         if !self.cli.is_file() {
             return Err(ProxyError::Invalid(format!(
-                "Official CodeBuddy CLI was not found: {}",
+                "Official CodeBuddy CLI was not found: {}. Set WORKBUDDY_CLI_PATH to the codebuddy executable, or add codebuddy to PATH.",
                 self.cli.display()
             )));
         }
         if self.processes.lock().len() >= self.max_sidecars {
+            self.reap_idle().await?;
+        }
+        if self.processes.lock().len() >= self.max_sidecars {
             return Err(ProxyError::Upstream(format!(
-                "Maximum active proxy sidecars reached ({})",
+                "Maximum active local proxy sidecars reached ({}). Stop an unused proxy session, lower PROXY_SIDECAR_IDLE_TIMEOUT, or increase PROXY_MAX_SIDECARS if this machine has sufficient resources. This setting does not control WorkBuddy upstream max_instances.",
                 self.max_sidecars
             )));
         }

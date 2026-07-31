@@ -167,6 +167,10 @@ mod tests {
     fn config(host: &str) -> Config {
         let mut environment = HashMap::new();
         environment.insert("HOME".into(), "/tmp".into());
+        environment.insert(
+            "FREEMODEL_BASE_URL".into(),
+            "https://example.test/v1".into(),
+        );
         environment.insert("PROXY_HOST".into(), host.into());
         environment.insert("PROXY_PORT".into(), "40589".into());
         Config::load_with_env(Path::new("/tmp"), &environment).unwrap()

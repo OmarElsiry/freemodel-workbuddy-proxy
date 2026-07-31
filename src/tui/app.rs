@@ -105,20 +105,43 @@ pub struct App {
     pub base_url: String,
     next_request_id: u64,
     pub last_user: Option<String>,
+    prompt_history: Vec<String>,
+    prompt_history_index: Option<usize>,
+    prompt_history_draft: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Insert(char),
+    InsertText(String),
     Newline,
     Backspace,
     Delete,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
+    Left {
+        select: bool,
+    },
+    Right {
+        select: bool,
+    },
+    Up {
+        width: usize,
+        select: bool,
+    },
+    Down {
+        width: usize,
+        select: bool,
+    },
+    Home {
+        select: bool,
+    },
+    End {
+        select: bool,
+    },
+    SelectAll,
+    CopySelection,
+    CutSelection,
+    PasteClipboard,
+    CutCommitted,
     Submit,
     Scroll(i16),
     ToggleSidebar,
@@ -195,6 +218,11 @@ pub enum Effect {
     ClearHistory,
     ChangeProject(Option<String>),
     Copy(String),
+    WriteClipboard {
+        text: String,
+        cut: bool,
+    },
+    ReadClipboard,
     LoadLogs,
     SaveKey(String),
     SavePreferences,
@@ -210,7 +238,9 @@ impl App {
         sidebar: bool,
         no_color: bool,
     ) -> Self {
-        let messages = session.history.iter().filter_map(from_value).collect();
+        let messages: Vec<ChatMessage> = session.history.iter().filter_map(from_value).collect();
+        let prompt_history = prompt_history_from_messages(&messages);
+        let last_user = prompt_history.last().cloned();
         Self {
             running: true,
             focus: Focus::Composer,
@@ -238,7 +268,10 @@ impl App {
             diagnostics: String::new(),
             base_url,
             next_request_id: 1,
-            last_user: None,
+            last_user,
+            prompt_history,
+            prompt_history_index: None,
+            prompt_history_draft: None,
         }
     }
     pub fn busy(&self) -> bool {
@@ -266,16 +299,68 @@ impl App {
     }
     pub fn update(&mut self, action: Action) -> Vec<Effect> {
         match action {
-            Action::Insert(c) if !self.busy() && self.modal.is_none() => self.composer.insert(c),
-            Action::Newline if !self.busy() => self.composer.newline(),
-            Action::Backspace if !self.busy() => self.composer.backspace(),
-            Action::Delete if !self.busy() => self.composer.delete(),
-            Action::Left => self.composer.left(),
-            Action::Right => self.composer.right(),
-            Action::Up => self.composer.up(),
-            Action::Down => self.composer.down(),
-            Action::Home => self.composer.home(),
-            Action::End => self.composer.end(),
+            Action::Insert(c) if !self.busy() && self.modal.is_none() => {
+                self.leave_prompt_history();
+                self.composer.insert(c);
+            }
+            Action::InsertText(text) if !self.busy() && self.modal.is_none() => {
+                self.leave_prompt_history();
+                self.composer.insert_str(&text);
+            }
+            Action::Newline if !self.busy() => {
+                self.leave_prompt_history();
+                self.composer.newline();
+            }
+            Action::Backspace if !self.busy() => {
+                self.leave_prompt_history();
+                self.composer.backspace();
+            }
+            Action::Delete if !self.busy() => {
+                self.leave_prompt_history();
+                self.composer.delete();
+            }
+            Action::Left { select } => {
+                self.leave_prompt_history();
+                self.composer.left(select);
+            }
+            Action::Right { select } => {
+                self.leave_prompt_history();
+                self.composer.right(select);
+            }
+            Action::Up { width, select } => {
+                if !self.composer.up(width, select) && !select {
+                    self.history_older();
+                }
+            }
+            Action::Down { width, select } => {
+                if !self.composer.down(width, select) && !select {
+                    self.history_newer();
+                }
+            }
+            Action::Home { select } => {
+                self.leave_prompt_history();
+                self.composer.home(select);
+            }
+            Action::End { select } => {
+                self.leave_prompt_history();
+                self.composer.end(select);
+            }
+            Action::SelectAll if !self.busy() => self.composer.select_all(),
+            Action::CopySelection if !self.busy() => {
+                if let Some(text) = self.composer.selected_text() {
+                    return vec![Effect::WriteClipboard { text, cut: false }];
+                }
+            }
+            Action::CutSelection if !self.busy() => {
+                if let Some(text) = self.composer.selected_text() {
+                    return vec![Effect::WriteClipboard { text, cut: true }];
+                }
+            }
+            Action::PasteClipboard if !self.busy() => return vec![Effect::ReadClipboard],
+            Action::CutCommitted if !self.busy() => {
+                self.leave_prompt_history();
+                self.composer.delete_selection();
+            }
             Action::Submit => return self.submit(),
             Action::ModalInput(c) => self.modal_input.insert(c),
             Action::ModalBackspace => self.modal_input.backspace(),
@@ -333,6 +418,10 @@ impl App {
             Action::Confirmed => return self.confirm(),
             Action::StartRequest { request_id, user } => {
                 self.last_user = Some(user.clone());
+                if self.prompt_history.last() != Some(&user) {
+                    self.prompt_history.push(user.clone());
+                }
+                self.reset_prompt_history_navigation();
                 self.messages.push(ChatMessage {
                     role: "user".into(),
                     content: user,
@@ -437,6 +526,10 @@ impl App {
                 self.session = v.clone();
                 self.project = v.project.clone();
                 self.messages = v.history.iter().filter_map(from_value).collect();
+                self.prompt_history = prompt_history_from_messages(&self.messages);
+                self.last_user = self.prompt_history.last().cloned();
+                self.reset_prompt_history_navigation();
+                self.composer.clear();
                 self.modal = None;
                 self.generation = GenerationState::Idle;
                 return vec![Effect::SavePreferences];
@@ -502,6 +595,7 @@ impl App {
             }
         }
         self.composer.clear();
+        self.reset_prompt_history_navigation();
         self.start(input)
     }
     fn start(&mut self, user: String) -> Vec<Effect> {
@@ -686,12 +780,62 @@ impl App {
             _ => vec![],
         }
     }
+    fn history_older(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        let index = match self.prompt_history_index {
+            Some(0) => return,
+            Some(index) => index - 1,
+            None => {
+                self.prompt_history_draft = Some(self.composer.text());
+                self.prompt_history.len() - 1
+            }
+        };
+        self.prompt_history_index = Some(index);
+        self.composer.set(self.prompt_history[index].clone());
+    }
+    fn history_newer(&mut self) {
+        let Some(index) = self.prompt_history_index else {
+            return;
+        };
+        if index + 1 < self.prompt_history.len() {
+            let next = index + 1;
+            self.prompt_history_index = Some(next);
+            self.composer.set(self.prompt_history[next].clone());
+        } else {
+            let draft = self.prompt_history_draft.take().unwrap_or_default();
+            self.prompt_history_index = None;
+            self.composer.set(draft);
+        }
+    }
+    fn leave_prompt_history(&mut self) {
+        if self.prompt_history_index.is_some() {
+            self.reset_prompt_history_navigation();
+        }
+    }
+    fn reset_prompt_history_navigation(&mut self) {
+        self.prompt_history_index = None;
+        self.prompt_history_draft = None;
+    }
     fn notify(&mut self, value: String) {
         if self.notifications.len() >= 4 {
             self.notifications.pop_front();
         }
         self.notifications.push_back(value)
     }
+}
+fn prompt_history_from_messages(messages: &[ChatMessage]) -> Vec<String> {
+    let mut history = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role == "user" && message.status == MessageStatus::Complete)
+    {
+        if history.last() != Some(&message.content) {
+            history.push(message.content.clone());
+        }
+    }
+    history
 }
 fn from_value(v: &Value) -> Option<ChatMessage> {
     Some(ChatMessage {
@@ -706,6 +850,96 @@ mod tests {
     fn session() -> SessionRecord {
         serde_json::from_value(json!({"id":"proxy-12345678","title":"Test","project":"/tmp","automatic":false,"created_at":"x","updated_at":"x","history":[],"sidecar":{}})).unwrap()
     }
+    #[test]
+    fn prompt_history_moves_at_boundaries_and_restores_draft() {
+        let mut record = session();
+        record.history = vec![
+            json!({"role":"user","content":"first"}),
+            json!({"role":"assistant","content":"one"}),
+            json!({"role":"user","content":"second"}),
+            json!({"role":"assistant","content":"two"}),
+        ];
+        let mut app = App::new(
+            "/tmp".into(),
+            record,
+            "gpt".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
+        app.composer.set("draft");
+        app.update(Action::Up {
+            width: 80,
+            select: false,
+        });
+        assert_eq!(app.composer.text(), "second");
+        app.update(Action::Up {
+            width: 80,
+            select: false,
+        });
+        assert_eq!(app.composer.text(), "first");
+        app.update(Action::Down {
+            width: 80,
+            select: false,
+        });
+        assert_eq!(app.composer.text(), "second");
+        app.update(Action::Down {
+            width: 80,
+            select: false,
+        });
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn multiline_vertical_movement_precedes_prompt_history() {
+        let mut record = session();
+        record.history = vec![json!({"role":"user","content":"old prompt"})];
+        let mut app = App::new(
+            "/tmp".into(),
+            record,
+            "gpt".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
+        app.composer.set("top\nbottom");
+        app.update(Action::Up {
+            width: 80,
+            select: false,
+        });
+        assert_eq!(app.composer.text(), "top\nbottom");
+        assert_eq!(app.composer.cursor(), 3);
+        app.update(Action::Up {
+            width: 80,
+            select: false,
+        });
+        assert_eq!(app.composer.text(), "old prompt");
+    }
+
+    #[test]
+    fn cut_waits_for_successful_clipboard_commit() {
+        let mut app = App::new(
+            "/tmp".into(),
+            session(),
+            "gpt".into(),
+            "http://127.0.0.1:40589/v1".into(),
+            true,
+            false,
+        );
+        app.composer.set("hello");
+        app.composer.left(true);
+        assert_eq!(
+            app.update(Action::CutSelection),
+            vec![Effect::WriteClipboard {
+                text: "o".into(),
+                cut: true,
+            }]
+        );
+        assert_eq!(app.composer.text(), "hello");
+        app.update(Action::CutCommitted);
+        assert_eq!(app.composer.text(), "hell");
+    }
+
     #[test]
     fn late_stream_events_are_ignored() {
         let mut a = App::new(
